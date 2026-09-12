@@ -21,7 +21,7 @@ services:
     depends_on:
       - db
     environment:
-      DATABASE_URL: postgresql+psycopg://barakat:barakat_dev_password@db:5432/barakat
+      DATABASE_URL: postgresql+psycopg://barakat:barakat_dev_password@172.18.0.1:5432/barakatt
       BALE_BOT_TOKEN: "1414334073:JPSKJ6n3py9F4b_nROnI4ToUonUxk_k_BjQ"
       CODESPACE_NAME: "${CODESPACE_NAME}"
     volumes:
