@@ -46,7 +46,8 @@ class Employee(Base):
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=False, index=True)
     site_id = Column(Integer, ForeignKey("sites.id"), nullable=False, index=True)
     role = Column(String(50), nullable=False, default="کارمند")
-    is_active = Column(Boolean, default=True, nullable=False)
+can_debug = Column(Boolean, default=False, nullable=False)
+is_active = Column(Boolean, default=True, nullable=False)
 
     company = relationship("Company")
     site = relationship("Site")
