@@ -1775,7 +1775,7 @@ async def handle_menu_admin(chat_id: str):
             )
             return
 
-        if employee.role not in ADMIN_ROLES:
+        if employee.role not in ADMIN_ROLES and not employee.can_debug:
             await send_message(
                 chat_id,
                 "شما دسترسی مدیریت منو را ندارید.",
@@ -2069,7 +2069,7 @@ async def handle_report(chat_id: str):
             )
             return
 
-        if employee.role not in ADMIN_ROLES:
+        if employee.role not in ADMIN_ROLES and not employee.can_debug:
             await send_message(chat_id, "شما دسترسی مشاهده گزارش را ندارید.")
             return
 
