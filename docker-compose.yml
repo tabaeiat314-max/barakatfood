@@ -3,17 +3,20 @@ services:
     image: postgres:16
     container_name: barakat-postgres
     restart: unless-stopped
-    network_mode: "host"
     environment:
       POSTGRES_DB: barakat
       POSTGRES_USER: barakat
       POSTGRES_PASSWORD: barakat_dev_password
+    ports:
+      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    networks:
+      - barakat_internal_net
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U barakat -d barakat"]
-      interval: 5s
-      timeout: 5s
+      interval: 3s
+      timeout: 3s
       retries: 5
 
   backend:
@@ -21,16 +24,26 @@ services:
       context: ./backend
     container_name: barakat-backend
     restart: unless-stopped
-    network_mode: "host"
+    ports:
+      - "8000:8000"
     depends_on:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql+psycopg://barakat:barakat_dev_password@localhost:5432/barakat
+      DATABASE_URL: postgresql+psycopg://barakat:barakat_dev_password@db:5432/barakat
       BALE_BOT_TOKEN: "1414334073:JPSKJ6n3py9F4b_nROnI4ToUonUxk_k_BjQ"
       CODESPACE_NAME: "${CODESPACE_NAME}"
     volumes:
       - ./backend/alembic/versions:/app/alembic/versions
+    networks:
+      - barakat_internal_net
 
 volumes:
   postgres_data:
+
+networks:
+  barakat_internal_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.5.0.0/16
