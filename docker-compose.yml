@@ -11,6 +11,12 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U barakat -d barakat"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   backend:
     build:
       context: ./backend
@@ -19,12 +25,14 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     environment:
-      DATABASE_URL: postgresql+psycopg://barakat:barakat_dev_password@172.18.0.1:5432/barakatt
+      DATABASE_URL: postgresql+psycopg://barakat:barakat_dev_password@db:5432/barakat
       BALE_BOT_TOKEN: "1414334073:JPSKJ6n3py9F4b_nROnI4ToUonUxk_k_BjQ"
       CODESPACE_NAME: "${CODESPACE_NAME}"
     volumes:
       - ./backend/alembic/versions:/app/alembic/versions
+
 volumes:
   postgres_data:
