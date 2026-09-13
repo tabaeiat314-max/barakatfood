@@ -34,7 +34,7 @@ def main_menu_keyboard(is_admin: bool, is_welfare_manager: bool) -> dict:
         [{"text": "🍽 سفارش"}, {"text": "📋 سفارش‌های من"}],
         [{"text": "❌ لغو سفارش"}],
     ]
-    if is_welfare_manager:
+    if is_welfare_manager or is_admin:
         rows.append([{"text": "👨‍💼 سفارش گروهی"}])
     if is_admin:
         rows.append([{"text": "⚙️ مدیریت منو"}, {"text": "📊 گزارش"}])
@@ -44,6 +44,29 @@ def main_menu_keyboard(is_admin: bool, is_welfare_manager: bool) -> dict:
         "resize_keyboard": True,
         "one_time_keyboard": False,
     }
+
+
+async def edit_message_text(
+    chat_id: str,
+    message_id: int | str,
+    text: str,
+    reply_markup: dict | None = None,
+):
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+    }
+
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(
+            f"{BASE_URL}/editMessageText",
+            json=payload,
+        )
+        return resp.json()
 
 
 async def answer_callback_query(callback_query_id: str, text: str | None = None):

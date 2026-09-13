@@ -8,7 +8,14 @@ from datetime import date, datetime, timedelta, timezone
 from fastapi import APIRouter, Request
 from sqlalchemy import func
 
-from app.bale.client import answer_callback_query, main_menu_keyboard, remove_keyboard, request_contact, send_message
+from app.bale.client import (
+    answer_callback_query,
+    edit_message_text,
+    main_menu_keyboard,
+    remove_keyboard,
+    request_contact,
+    send_message,
+)
 from app.db import SessionLocal
 from app.models import (
     Company,
@@ -1549,7 +1556,523 @@ async def handle_cancel_choice(chat_id: str, text: str):
 # WELFARE
 # =========================================================
 
+async def render_welfare_selection(chat_id: str):
+    session = SESSIONS.get(str(chat_id))
+    if not session or session.get("state") != "welfare_select":
+        return
+
+    db = SessionLocal()
+    try:
+        options = session.get("options", [])
+        selected = session.setdefault("selected", {})
+        active_food_id = session.get("active_food_id")
+
+        menu_entries = (
+            db.query(MenuEntry)
+            .filter(MenuEntry.id.in_(options))
+            .filter(MenuEntry.status == "منتشر")
+            .filter(MenuEntry.is_selectable == True)
+            .order_by(MenuEntry.display_order)
+            .all()
+        )
+
+        entry_map = {entry.id: entry for entry in menu_entries}
+
+        lines = [
+            "👨‍💼 ثبت سفارش گروهی",
+            f"📅 تاریخ: {to_jalali(session['target_date'])}",
+            "",
+            "غذاها را انتخاب کنید:",
+        ]
+
+        for entry in menu_entries:
+            qty = selected.get(entry.id, 0)
+            marker = "🔹" if entry.id == active_food_id else "🍽"
+
+            if qty:
+                lines.append(f"{marker} {entry.food.name} — {qty} عدد")
+            else:
+                lines.append(f"{marker} {entry.food.name}")
+
+        if active_food_id and active_food_id in entry_map:
+            active_entry = entry_map[active_food_id]
+            qty = selected.get(active_food_id, 0)
+
+            lines.extend([
+                "",
+                f"انتخاب فعلی: {active_entry.food.name}",
+                f"تعداد: {qty}",
+            ])
+
+        elif selected:
+            lines.extend([
+                "",
+                "سفارش‌های انتخاب‌شده:",
+            ])
+
+            for entry_id, qty in selected.items():
+                entry = entry_map.get(entry_id)
+                if entry:
+                    lines.append(f"• {entry.food.name}: {qty} عدد")
+
+        else:
+            lines.extend([
+                "",
+                "ابتدا غذا را انتخاب کنید.",
+            ])
+
+        keyboard = []
+
+        for entry in menu_entries:
+            qty = selected.get(entry.id, 0)
+
+            text = f"🍽 {entry.food.name}"
+            if qty:
+                text += f" ({qty})"
+
+            keyboard.append([
+                {
+                    "text": text,
+                    "callback_data": f"welfare_food:{entry.id}",
+                }
+            ])
+
+        if active_food_id and active_food_id in entry_map:
+            keyboard.append([
+                {
+                    "text": "➖",
+                    "callback_data": f"welfare_minus:{active_food_id}",
+                },
+                {
+                    "text": "➕",
+                    "callback_data": f"welfare_plus:{active_food_id}",
+                },
+                {
+                    "text": "✍️ ورود تعداد",
+                    "callback_data": f"welfare_qty:{active_food_id}",
+                },
+                {
+                    "text": "🗑 حذف",
+                    "callback_data": f"welfare_remove:{active_food_id}",
+                },
+            ])
+
+        keyboard.append([
+            {
+                "text": "✅ ثبت سفارش",
+                "callback_data": "welfare_submit:1",
+            }
+        ])
+
+        keyboard.append([
+            NAV_BACK_BUTTON,
+            NAV_HOME_BUTTON,
+        ])
+
+        text = "\n".join(lines)
+        reply_markup = {"inline_keyboard": keyboard}
+
+        message_id = session.get("message_id")
+
+        if message_id:
+            result = await edit_message_text(
+                chat_id,
+                message_id,
+                text,
+                reply_markup,
+            )
+
+            # اگر پیام دیگر قابل ویرایش نبود، پیام جدید بساز
+            if not result.get("ok", True):
+                result = await send_message(
+                    chat_id,
+                    text,
+                    reply_markup,
+                )
+
+                new_message_id = (
+                    result.get("result", {}).get("message_id")
+                    if isinstance(result, dict)
+                    else None
+                )
+
+                if new_message_id:
+                    session["message_id"] = new_message_id
+
+        else:
+            result = await send_message(
+                chat_id,
+                text,
+                reply_markup,
+            )
+
+            message_id = (
+                result.get("result", {}).get("message_id")
+                if isinstance(result, dict)
+                else None
+            )
+
+            if message_id:
+                session["message_id"] = message_id
+
+    finally:
+        db.close()
+
+
+async def send_welfare_date_menu(chat_id: str):
+    db = SessionLocal()
+    try:
+        today = today_iran()
+        tomorrow = today + timedelta(days=1)
+
+        today_ok = can_create_order_for_date(db, today)
+        tomorrow_ok = can_create_order_for_date(db, tomorrow)
+    finally:
+        db.close()
+
+    date_row = []
+
+    if today_ok:
+        date_row.append({
+            "text": "1️⃣ امروز",
+            "callback_data": "welfare_date:1",
+        })
+
+    if tomorrow_ok:
+        date_row.append({
+            "text": "2️⃣ فردا",
+            "callback_data": "welfare_date:2",
+        })
+
+    if not date_row:
+        await send_message(
+            chat_id,
+            "⛔ مهلت ثبت سفارش برای امروز و فردا به پایان رسیده است.",
+            reply_markup=with_nav_row([], back=False),
+        )
+        return
+
+    await send_message(
+        chat_id,
+        "👨‍💼 ثبت سفارش گروهی\n\nبرای چه روزی می‌خواهید سفارش ثبت کنید؟",
+        reply_markup=with_nav_row([date_row], back=False),
+    )
+
+
 async def handle_welfare(chat_id: str):
+    db = SessionLocal()
+    try:
+        employee = get_employee(chat_id, db)
+
+        if not employee:
+            await send_message(
+                chat_id,
+                "ابتدا دستور /start را ارسال کنید.",
+            )
+            return
+
+        is_admin = employee.role in ADMIN_ROLES
+
+        assignment = (
+            db.query(WelfareManagerAssignment)
+            .filter(
+                WelfareManagerAssignment.employee_id == employee.id,
+                WelfareManagerAssignment.is_active == True,
+            )
+            .first()
+        )
+
+        if not assignment and not is_admin:
+            await send_message(
+                chat_id,
+                "شما دسترسی ثبت سفارش گروهی ندارید.",
+            )
+            return
+
+        SESSIONS[str(chat_id)] = {
+            "state": "welfare_choose_date",
+            "employee_id": employee.id,
+        }
+
+    finally:
+        db.close()
+
+    await send_welfare_date_menu(chat_id)
+
+
+async def handle_welfare_date_choice(chat_id: str, value: str):
+    session = SESSIONS.get(str(chat_id))
+
+    if not session or session.get("state") != "welfare_choose_date":
+        return False
+
+    if value not in {"1", "2"}:
+        return True
+
+    target_date = today_iran()
+
+    if value == "2":
+        target_date += timedelta(days=1)
+
+    db = SessionLocal()
+    try:
+        employee = (
+            db.query(Employee)
+            .filter(Employee.id == session["employee_id"])
+            .first()
+        )
+
+        if not employee:
+            await send_message(chat_id, "کاربر پیدا نشد.")
+            clear_session(chat_id)
+            return True
+
+        is_admin = employee.role in ADMIN_ROLES
+
+        assignment = (
+            db.query(WelfareManagerAssignment)
+            .filter(
+                WelfareManagerAssignment.employee_id == employee.id,
+                WelfareManagerAssignment.is_active == True,
+            )
+            .first()
+        )
+
+        if not assignment and not is_admin:
+            await send_message(
+                chat_id,
+                "شما دسترسی ثبت سفارش گروهی ندارید.",
+            )
+            clear_session(chat_id)
+            return True
+
+        if not can_create_order_for_date(db, target_date):
+            label = "امروز" if value == "1" else "فردا"
+            await send_message(
+                chat_id,
+                f"⛔ مهلت ثبت سفارش برای {label} به پایان رسیده است.",
+            )
+            return True
+
+        if assignment:
+            site_id = assignment.site_id
+        else:
+            active_site = (
+                db.query(Site)
+                .filter(Site.is_active == True)
+                .order_by(Site.id)
+                .first()
+            )
+
+            if not active_site:
+                await send_message(
+                    chat_id,
+                    "هیچ سایت فعالی برای ثبت سفارش گروهی وجود ندارد.",
+                )
+                return True
+
+            site_id = active_site.id
+
+        menu_entries = get_menu(
+            db,
+            site_id,
+            target_date,
+        )
+
+        if not menu_entries:
+            await send_message(
+                chat_id,
+                f"برای تاریخ {to_jalali(target_date)} منوی قابل سفارش ثبت نشده است.",
+            )
+            return True
+
+        SESSIONS[str(chat_id)] = {
+            "state": "welfare_select",
+            "options": [entry.id for entry in menu_entries],
+            "selected": {},
+            "active_food_id": None,
+            "site_id": site_id,
+            "target_date": target_date,
+            "employee_id": employee.id,
+        }
+
+    finally:
+        db.close()
+
+    await render_welfare_selection(chat_id)
+    return True
+
+
+async def handle_welfare_food_choice(chat_id: str, value: str):
+    session = SESSIONS.get(str(chat_id))
+
+    if not session or session.get("state") != "welfare_select":
+        return
+
+    try:
+        entry_id = int(value)
+    except (TypeError, ValueError):
+        return
+
+    if entry_id not in session.get("options", []):
+        return
+
+    selected = session.setdefault("selected", {})
+
+    if entry_id not in selected:
+        selected[entry_id] = 1
+
+    session["active_food_id"] = entry_id
+
+    await render_welfare_selection(chat_id)
+
+
+async def handle_welfare_quantity_request(chat_id: str, value: str):
+    session = SESSIONS.get(str(chat_id))
+
+    if not session or session.get("state") != "welfare_select":
+        return
+
+    try:
+        entry_id = int(value)
+    except (TypeError, ValueError):
+        return
+
+    if entry_id not in session.get("options", []):
+        return
+
+    session["active_food_id"] = entry_id
+    session["state"] = "welfare_waiting_quantity"
+
+    message_id = session.get("message_id")
+
+    prompt = (
+        "🔢 تعداد سفارش را وارد کنید.\n\n"
+        "مثلاً: 80\n\n"
+        "⬅️ برای برگشت، از دکمه‌های پایین استفاده کنید."
+    )
+
+    if message_id:
+        result = await edit_message_text(
+            chat_id,
+            message_id,
+            prompt,
+            {
+                "inline_keyboard": [
+                    [
+                        NAV_BACK_BUTTON,
+                        NAV_HOME_BUTTON,
+                    ]
+                ]
+            },
+        )
+
+        if not result.get("ok", True):
+            await send_message(chat_id, prompt)
+    else:
+        result = await send_message(
+            chat_id,
+            prompt,
+            {
+                "inline_keyboard": [
+                    [
+                        NAV_BACK_BUTTON,
+                        NAV_HOME_BUTTON,
+                    ]
+                ]
+            },
+        )
+
+        if isinstance(result, dict):
+            new_message_id = result.get("result", {}).get("message_id")
+            if new_message_id:
+                session["message_id"] = new_message_id
+
+
+async def handle_welfare_plus(chat_id: str, value: str):
+    session = SESSIONS.get(str(chat_id))
+
+    if not session or session.get("state") != "welfare_select":
+        return
+
+    try:
+        entry_id = int(value)
+    except (TypeError, ValueError):
+        return
+
+    selected = session.setdefault("selected", {})
+
+    if entry_id not in selected:
+        selected[entry_id] = 1
+    else:
+        selected[entry_id] += 1
+
+    session["active_food_id"] = entry_id
+
+    await render_welfare_selection(chat_id)
+
+
+async def handle_welfare_minus(chat_id: str, value: str):
+    session = SESSIONS.get(str(chat_id))
+
+    if not session or session.get("state") != "welfare_select":
+        return
+
+    try:
+        entry_id = int(value)
+    except (TypeError, ValueError):
+        return
+
+    selected = session.setdefault("selected", {})
+
+    if entry_id not in selected:
+        return
+
+    if selected[entry_id] <= 1:
+        selected.pop(entry_id, None)
+        if session.get("active_food_id") == entry_id:
+            session["active_food_id"] = None
+    else:
+        selected[entry_id] -= 1
+
+    await render_welfare_selection(chat_id)
+
+
+async def handle_welfare_remove(chat_id: str, value: str):
+    session = SESSIONS.get(str(chat_id))
+
+    if not session or session.get("state") != "welfare_select":
+        return
+
+    try:
+        entry_id = int(value)
+    except (TypeError, ValueError):
+        return
+
+    selected = session.setdefault("selected", {})
+    selected.pop(entry_id, None)
+
+    if session.get("active_food_id") == entry_id:
+        session["active_food_id"] = None
+
+    await render_welfare_selection(chat_id)
+
+
+async def handle_welfare_submit(chat_id: str):
+    session = SESSIONS.get(str(chat_id))
+
+    if not session or session.get("state") != "welfare_select":
+        return
+
+    selected = session.get("selected") or {}
+
+    if not selected:
+        await send_message(
+            chat_id,
+            "⚠️ حداقل یک غذا را انتخاب کنید.",
+        )
+        return
+
     db = SessionLocal()
 
     try:
@@ -1562,70 +2085,91 @@ async def handle_welfare(chat_id: str):
             )
             return
 
-        assignment = (
-            db.query(WelfareManagerAssignment)
-            .filter(
-                WelfareManagerAssignment.employee_id == employee.id,
-                WelfareManagerAssignment.is_active == True,  # noqa: E712
-            )
-            .first()
-        )
-
-        if not assignment:
-            await send_message(
-                chat_id,
-                "شما به‌عنوان مسئول رفاهی ثبت نشده‌اید.",
-            )
-            return
-
-        target_date = today_iran()
+        target_date = session["target_date"]
 
         if not can_create_order_for_date(db, target_date):
             await send_message(
                 chat_id,
-                "مهلت ثبت سفارش امروز به پایان رسیده است.",
+                "⛔ مهلت ثبت سفارش به پایان رسیده است.",
             )
             return
 
-        menu_entries = get_menu(
-            db,
-            assignment.site_id,
-            target_date,
+        menu_entries = (
+            db.query(MenuEntry)
+            .filter(
+                MenuEntry.id.in_(list(selected.keys())),
+                MenuEntry.site_id == session["site_id"],
+                MenuEntry.date == target_date,
+                MenuEntry.status == "منتشر",
+                MenuEntry.is_selectable == True,
+            )
+            .all()
         )
 
-        if not menu_entries:
+        entry_map = {entry.id: entry for entry in menu_entries}
+
+        invalid = [
+            entry_id
+            for entry_id in selected
+            if entry_id not in entry_map
+        ]
+
+        if invalid:
             await send_message(
                 chat_id,
-                "برای امروز منوی منتشرشده وجود ندارد.",
+                "⚠️ یکی از غذاهای انتخاب‌شده دیگر قابل سفارش نیست. دوباره منو را باز کنید.",
             )
             return
 
+        created_codes = []
+
+        for entry_id, quantity in selected.items():
+            if quantity <= 0:
+                continue
+
+            entry = entry_map[entry_id]
+
+            code = make_code("W", db, WelfareOrder)
+
+            order = WelfareOrder(
+                tracking_code=code,
+                date=target_date,
+                site_id=session["site_id"],
+                food_id=entry.food_id,
+                quantity=quantity,
+                status="نهایی",
+                source="Bale",
+                created_by=employee.full_name,
+            )
+
+            db.add(order)
+            created_codes.append(
+                (entry.food.name, quantity, code)
+            )
+
+        db.commit()
+
         lines = [
-            "👨‍💼 ثبت سفارش گروهی",
+            "✅ سفارش گروهی با موفقیت ثبت شد.",
             f"📅 تاریخ: {to_jalali(target_date)}",
-            "",
-            "تعداد هر غذا را به شکل زیر ارسال کنید:",
-            "مثال: 1:70 2:30",
             "",
         ]
 
-        for idx, entry in enumerate(menu_entries, start=1):
+        for food_name, quantity, code in created_codes:
             lines.append(
-                f"{idx}. {entry.food.name}"
+                f"🍽 {food_name}: {quantity} عدد"
+            )
+            lines.append(
+                f"🔖 کد پیگیری: {code}"
             )
 
-        SESSIONS[str(chat_id)] = {
-            "state": "welfare_quantities",
-            "options": [entry.id for entry in menu_entries],
-            "site_id": assignment.site_id,
-            "target_date": target_date,
-        }
+        clear_session(chat_id)
 
-        await send_message(
-            chat_id,
-            "\n".join(lines),
-        )
+        await send_message(chat_id, "\n".join(lines))
 
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
@@ -1633,132 +2177,57 @@ async def handle_welfare(chat_id: str):
 async def handle_welfare_quantities(chat_id: str, text: str):
     session = SESSIONS.get(str(chat_id))
 
-    if not session or session.get("state") != "welfare_quantities":
+    if not session or session.get("state") != "welfare_waiting_quantity":
         return False
 
-    pairs = text.strip().split()
+    text = (text or "").strip()
 
-    if not pairs:
+    if not text.isdigit():
         await send_message(
             chat_id,
-            "هیچ سفارشی دریافت نشد.",
+            "⛔ لطفاً فقط تعداد را به صورت عدد وارد کنید.\n\n"
+            "مثلاً: 80",
         )
         return True
 
-    parsed = []
+    quantity = int(text)
 
-    for pair in pairs:
-        if ":" not in pair:
-            await send_message(
-                chat_id,
-                "فرمت نامعتبر است.\n"
-                "مثال: 1:70 2:30",
-            )
-            return True
-
-        idx_str, qty_str = pair.split(":", 1)
-
-        if not idx_str.isdigit() or not qty_str.isdigit():
-            await send_message(
-                chat_id,
-                "فرمت نامعتبر است.",
-            )
-            return True
-
-        idx = int(idx_str)
-        qty = int(qty_str)
-
-        if (
-            idx < 1
-            or idx > len(session["options"])
-            or qty <= 0
-        ):
-            await send_message(
-                chat_id,
-                "شماره غذا یا تعداد نامعتبر است.",
-            )
-            return True
-
-        parsed.append(
-            (
-                session["options"][idx - 1],
-                qty,
-            )
-        )
-
-    db = SessionLocal()
-
-    try:
-        employee = get_employee(chat_id, db)
-
-        target_date = session["target_date"]
-
-        if not employee:
-            await send_message(
-                chat_id,
-                "کاربر پیدا نشد.",
-            )
-            return True
-
-        if not can_create_order_for_date(db, target_date):
-            await send_message(
-                chat_id,
-                "مهلت ثبت سفارش گروهی به پایان رسیده است.",
-            )
-            return True
-
-        created_codes = []
-
-        for menu_entry_id, qty in parsed:
-            entry = (
-                db.query(MenuEntry)
-                .filter(MenuEntry.id == menu_entry_id)
-                .first()
-            )
-
-            if not entry:
-                continue
-
-            tracking_code = make_code(
-                "W",
-                db,
-                WelfareOrder,
-            )
-
-            order = WelfareOrder(
-                tracking_code=tracking_code,
-                date=target_date,
-                site_id=session["site_id"],
-                food_id=entry.food_id,
-                quantity=qty,
-                status="نهایی",
-                source="Bale",
-                created_by=employee.full_name,
-            )
-
-            db.add(order)
-
-            created_codes.append(
-                f"🍽 {entry.food.name}: {qty} عدد\n"
-                f"کد: {tracking_code}"
-            )
-
-        db.commit()
-
+    if quantity <= 0:
         await send_message(
             chat_id,
-            "سفارش گروهی ثبت شد ✅\n\n"
-            + "\n\n".join(created_codes),
+            "⛔ تعداد باید بیشتر از صفر باشد.",
         )
+        return True
 
-    finally:
-        db.close()
-        clear_session(chat_id)
+    if quantity > 9999:
+        await send_message(
+            chat_id,
+            "⛔ حداکثر تعداد مجاز 9999 عدد است.",
+        )
+        return True
+
+    entry_id = session.get("active_food_id")
+
+    if not entry_id:
+        session["state"] = "welfare_select"
+        await render_welfare_selection(chat_id)
+        return True
+
+    if entry_id not in session.get("options", []):
+        session["state"] = "welfare_select"
+        await render_welfare_selection(chat_id)
+        return True
+
+    selected = session.setdefault("selected", {})
+    selected[entry_id] = quantity
+
+    session["state"] = "welfare_select"
+
+    await render_welfare_selection(chat_id)
 
     return True
 
 
-# =========================================================
 # ADMIN MENU
 # =========================================================
 
@@ -2104,14 +2573,28 @@ async def bale_webhook(request: Request):
 
             if prefix == "nav":
                 await handle_nav(cb_chat_id, value)
+            elif prefix == "welfare_date":
+                await handle_welfare_date_choice(cb_chat_id, value)
             elif prefix == "order_date":
                 await handle_order_date_choice(cb_chat_id, value, force_new=True)
             elif prefix == "order_food":
                 await handle_order_food_choice(cb_chat_id, value)
             elif prefix == "order_confirm":
                 await handle_order_confirm(cb_chat_id, value)
-            elif prefix == "order_food":
-                await handle_order_food_choice(cb_chat_id, value)
+            elif prefix == "welfare_food":
+                await handle_welfare_food_choice(cb_chat_id, value)
+            elif prefix == "welfare_plus":
+                await handle_welfare_plus(cb_chat_id, value)
+            elif prefix == "welfare_minus":
+                await handle_welfare_minus(cb_chat_id, value)
+            elif prefix == "welfare_remove":
+                await handle_welfare_remove(cb_chat_id, value)
+            elif prefix == "welfare_qty":
+                await handle_welfare_quantity_request(cb_chat_id, value)
+            elif prefix == "welfare_submit":
+                await handle_welfare_submit(cb_chat_id)
+            elif prefix == "welfare_noop":
+                pass
             elif prefix == "cancel_choice":
                 await handle_cancel_choice(cb_chat_id, value)
             elif prefix == "myorder_edit":
