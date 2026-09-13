@@ -264,6 +264,20 @@ def with_nav_row(keyboard_rows: list, back: bool = True) -> dict:
     return {"inline_keyboard": rows}
 
 
+def chunk_keyboard_labels(labels: list[str], min_columns: int = 2, max_columns: int = 3) -> list[list[str]]:
+    """
+    چیدمان دکمه‌های reply keyboard در ۲ یا ۳ ستون بر اساس طول متوسط برچسب‌ها.
+    """
+    if not labels:
+        return []
+    avg_len = sum(len(label) for label in labels) / len(labels)
+    columns = max_columns if avg_len <= 10 else min_columns
+    rows = []
+    for i in range(0, len(labels), columns):
+        rows.append(labels[i:i + columns])
+    return rows
+
+
 async def send_main_menu(chat_id: str, prefix: str | None = None):
     clear_session(chat_id)
 
@@ -343,19 +357,13 @@ async def handle_nav(chat_id: str, value: str):
                 await send_main_menu(chat_id)
                 return True
 
-            lines = [
-                f"منوی سفارش برای {to_jalali(target_date)}:",
-                "",
-            ]
-            keyboard_rows = []
+            message = (
+                f"منوی سفارش برای {to_jalali(target_date)}:\n\n"
+                "لطفاً غذای مورد نظر را از دکمه‌های پایین انتخاب کنید."
+            )
 
-            for idx, entry in enumerate(menu_entries, start=1):
-                lines.append(f"{idx}️⃣ {entry.food.name}")
-
-            for idx, entry in enumerate(menu_entries, start=1):
-                keyboard_rows.append(
-                    [{"text": f"{idx}. {entry.food.name}", "callback_data": f"order_food:{idx}"}]
-                )
+            keyboard_rows = chunk_keyboard_labels([entry.food.name for entry in menu_entries])
+            keyboard_rows.append(["🔙 بازگشت", "🏠 منوی اصلی"])
 
             new_session = {
                 "state": "order_choose_food",
@@ -363,6 +371,7 @@ async def handle_nav(chat_id: str, value: str):
                 "site_id": site_id,
                 "target_date": target_date,
                 "options": [entry.id for entry in menu_entries],
+                "option_labels": [entry.food.name for entry in menu_entries],
             }
             if editing_order_id:
                 new_session["editing_order_id"] = editing_order_id
@@ -371,8 +380,12 @@ async def handle_nav(chat_id: str, value: str):
 
             await send_message(
                 chat_id,
-                "\n".join(lines),
-                reply_markup=with_nav_row(keyboard_rows),
+                message,
+                reply_markup={
+                    "keyboard": keyboard_rows,
+                    "resize_keyboard": True,
+                    "one_time_keyboard": False,
+                },
             )
             return True
         finally:
@@ -518,24 +531,29 @@ async def send_order_date_menu(chat_id: str, prefix: str | None = None):
     finally:
         db.close()
 
-    date_row = []
+    date_labels = []
     if today_ok:
-        date_row.append({"text": "1️⃣ امروز", "callback_data": "order_date:1"})
+        date_labels.append("1️⃣ امروز")
     if tomorrow_ok:
-        date_row.append({"text": "2️⃣ فردا", "callback_data": "order_date:2"})
+        date_labels.append("2️⃣ فردا")
 
-    if not date_row:
+    if not date_labels:
         message += "⛔ در حال حاضر مهلت ثبت سفارش برای امروز و فردا به پایان رسیده است."
-        keyboard = with_nav_row([], back=False)
+        keyboard = {
+            "keyboard": [["🏠 منوی اصلی"]],
+            "resize_keyboard": True,
+            "one_time_keyboard": False,
+        }
         await send_message(chat_id, message, reply_markup=keyboard)
         return
 
     message += "برای چه روزی می‌خواهید سفارش ثبت کنید؟"
 
-    keyboard = with_nav_row(
-        [date_row],
-        back=False,
-    )
+    keyboard = {
+        "keyboard": [date_labels, ["🏠 منوی اصلی"]],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+    }
 
     await send_message(chat_id, message, reply_markup=keyboard)
 
@@ -590,6 +608,11 @@ async def handle_order_date_choice(chat_id: str, text: str, force_new: bool = Fa
         return False
 
     choice_text = text.strip()
+
+    if "امروز" in choice_text:
+        choice_text = "1"
+    elif "فردا" in choice_text:
+        choice_text = "2"
 
     if choice_text not in {"1", "2"}:
         await send_message(
@@ -756,22 +779,13 @@ async def handle_order_date_choice(chat_id: str, text: str, force_new: bool = Fa
         # نمایش غذاها
         # -----------------------------------------------------
 
-        lines = [
-            f"منوی سفارش برای "
-            f"{to_jalali(target_date)}:",
-            "",
-        ]
-        keyboard_rows = []
+        message = (
+            f"منوی سفارش برای {to_jalali(target_date)}:\n\n"
+            "لطفاً غذای مورد نظر را از دکمه‌های پایین انتخاب کنید."
+        )
 
-        for idx, entry in enumerate(menu_entries, start=1):
-            lines.append(
-                f"{idx}️⃣ {entry.food.name}"
-            )
-
-        for idx, entry in enumerate(menu_entries, start=1):
-            keyboard_rows.append(
-                [{"text": f"{idx}. {entry.food.name}", "callback_data": f"order_food:{idx}"}]
-            )
+        keyboard_rows = chunk_keyboard_labels([entry.food.name for entry in menu_entries])
+        keyboard_rows.append(["🔙 بازگشت", "🏠 منوی اصلی"])
 
         SESSIONS[str(chat_id)] = {
             "state": "order_choose_food",
@@ -779,12 +793,17 @@ async def handle_order_date_choice(chat_id: str, text: str, force_new: bool = Fa
             "site_id": employee.site_id,
             "target_date": target_date,
             "options": [entry.id for entry in menu_entries],
+            "option_labels": [entry.food.name for entry in menu_entries],
         }
 
         await send_message(
             chat_id,
-            "\n".join(lines),
-            reply_markup=with_nav_row(keyboard_rows),
+            message,
+            reply_markup={
+                "keyboard": keyboard_rows,
+                "resize_keyboard": True,
+                "one_time_keyboard": False,
+            },
         )
 
     finally:
@@ -803,20 +822,20 @@ async def handle_order_food_choice(chat_id: str, text: str):
     if not session or session.get("state") != "order_choose_food":
         return False
 
-    if not text.strip().isdigit():
-        await send_message(
-            chat_id,
-            "لطفاً فقط شماره غذا را ارسال کنید.",
-        )
-        return True
-
-    choice = int(text.strip())
+    choice_text = text.strip()
     options = session["options"]
+    option_labels = session.get("option_labels") or []
 
-    if choice < 1 or choice > len(options):
+    choice = None
+    if choice_text.isdigit():
+        choice = int(choice_text)
+    elif choice_text in option_labels:
+        choice = option_labels.index(choice_text) + 1
+
+    if not choice or choice < 1 or choice > len(options):
         await send_message(
             chat_id,
-            "شماره غذا نامعتبر است.",
+            "لطفاً یکی از گزینه‌های موجود را انتخاب کنید.",
         )
         return True
 
@@ -1373,19 +1392,13 @@ async def handle_myorder_edit(chat_id: str, text: str):
             clear_session(chat_id)
             return True
 
-        lines = [
-            f"ویرایش سفارش {to_jalali(target_date)} — غذای جدید را انتخاب کنید:",
-            "",
-        ]
-        keyboard_rows = []
+        message = (
+            f"ویرایش سفارش {to_jalali(target_date)} — غذای جدید را انتخاب کنید:\n\n"
+            "لطفاً غذای مورد نظر را از دکمه‌های پایین انتخاب کنید."
+        )
 
-        for idx, entry in enumerate(menu_entries, start=1):
-            lines.append(f"{idx}️⃣ {entry.food.name}")
-
-        for idx, entry in enumerate(menu_entries, start=1):
-            keyboard_rows.append(
-                [{"text": f"{idx}. {entry.food.name}", "callback_data": f"order_food:{idx}"}]
-            )
+        keyboard_rows = chunk_keyboard_labels([entry.food.name for entry in menu_entries])
+        keyboard_rows.append(["🔙 بازگشت", "🏠 منوی اصلی"])
 
         SESSIONS[str(chat_id)] = {
             "state": "order_choose_food",
@@ -1393,13 +1406,18 @@ async def handle_myorder_edit(chat_id: str, text: str):
             "site_id": employee.site_id,
             "target_date": target_date,
             "options": [entry.id for entry in menu_entries],
+            "option_labels": [entry.food.name for entry in menu_entries],
             "editing_order_id": order.id,
         }
 
         await send_message(
             chat_id,
-            "\n".join(lines),
-            reply_markup=with_nav_row(keyboard_rows),
+            message,
+            reply_markup={
+                "keyboard": keyboard_rows,
+                "resize_keyboard": True,
+                "one_time_keyboard": False,
+            },
         )
 
     finally:
@@ -2623,6 +2641,14 @@ async def bale_webhook(request: Request):
 
     contact = message.get("contact")
     text = (message.get("text") or "").strip()
+
+    if text == "🔙 بازگشت":
+        await handle_nav(chat_id, "back")
+        return {"ok": True}
+
+    if text == "🏠 منوی اصلی":
+        await handle_nav(chat_id, "home")
+        return {"ok": True}
 
     if text in BUTTON_COMMANDS:
         text = BUTTON_COMMANDS[text]
