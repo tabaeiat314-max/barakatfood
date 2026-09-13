@@ -1576,10 +1576,12 @@ async def handle_cancel_choice(chat_id: str, text: str):
 
 async def render_welfare_selection(chat_id: str):
     session = SESSIONS.get(str(chat_id))
+
     if not session or session.get("state") != "welfare_select":
         return
 
     db = SessionLocal()
+
     try:
         options = session.get("options", [])
         selected = session.setdefault("selected", {})
@@ -1589,7 +1591,7 @@ async def render_welfare_selection(chat_id: str):
             db.query(MenuEntry)
             .filter(MenuEntry.id.in_(options))
             .filter(MenuEntry.status == "منتشر")
-            .filter(MenuEntry.is_selectable == True)
+            .filter(MenuEntry.is_selectable == True)  # noqa: E712
             .order_by(MenuEntry.display_order)
             .all()
         )
@@ -1605,12 +1607,15 @@ async def render_welfare_selection(chat_id: str):
 
         for entry in menu_entries:
             qty = selected.get(entry.id, 0)
-            marker = "🔹" if entry.id == active_food_id else "🍽"
 
             if qty:
-                lines.append(f"{marker} {entry.food.name} — {qty} عدد")
+                lines.append(
+                    f"🍽 {entry.food.name} — {qty} عدد"
+                )
             else:
-                lines.append(f"{marker} {entry.food.name}")
+                lines.append(
+                    f"🍽 {entry.food.name}"
+                )
 
         if active_food_id and active_food_id in entry_map:
             active_entry = entry_map[active_food_id]
@@ -1618,8 +1623,8 @@ async def render_welfare_selection(chat_id: str):
 
             lines.extend([
                 "",
-                f"انتخاب فعلی: {active_entry.food.name}",
-                f"تعداد: {qty}",
+                f"غذای انتخاب‌شده: {active_entry.food.name}",
+                f"تعداد: {qty} عدد",
             ])
 
         elif selected:
@@ -1630,8 +1635,11 @@ async def render_welfare_selection(chat_id: str):
 
             for entry_id, qty in selected.items():
                 entry = entry_map.get(entry_id)
+
                 if entry:
-                    lines.append(f"• {entry.food.name}: {qty} عدد")
+                    lines.append(
+                        f"• {entry.food.name}: {qty} عدد"
+                    )
 
         else:
             lines.extend([
@@ -1644,13 +1652,14 @@ async def render_welfare_selection(chat_id: str):
         for entry in menu_entries:
             qty = selected.get(entry.id, 0)
 
-            text = f"🍽 {entry.food.name}"
             if qty:
-                text += f" ({qty})"
+                button_text = f"✅ {entry.food.name} ({qty})"
+            else:
+                button_text = f"🍽 {entry.food.name}"
 
             keyboard.append([
                 {
-                    "text": text,
+                    "text": button_text,
                     "callback_data": f"welfare_food:{entry.id}",
                 }
             ])
@@ -1662,9 +1671,16 @@ async def render_welfare_selection(chat_id: str):
                     "callback_data": f"welfare_minus:{active_food_id}",
                 },
                 {
+                    "text": f"🔢 {selected.get(active_food_id, 0)}",
+                    "callback_data": f"welfare_qty:{active_food_id}",
+                },
+                {
                     "text": "➕",
                     "callback_data": f"welfare_plus:{active_food_id}",
                 },
+            ])
+
+            keyboard.append([
                 {
                     "text": "✍️ ورود تعداد",
                     "callback_data": f"welfare_qty:{active_food_id}",
@@ -1675,12 +1691,13 @@ async def render_welfare_selection(chat_id: str):
                 },
             ])
 
-        keyboard.append([
-            {
-                "text": "✅ ثبت سفارش",
-                "callback_data": "welfare_submit:1",
-            }
-        ])
+        if selected:
+            keyboard.append([
+                {
+                    "text": "✅ ثبت سفارش",
+                    "callback_data": "welfare_submit:1",
+                }
+            ])
 
         keyboard.append([
             NAV_BACK_BUTTON,
@@ -1688,7 +1705,10 @@ async def render_welfare_selection(chat_id: str):
         ])
 
         text = "\n".join(lines)
-        reply_markup = {"inline_keyboard": keyboard}
+
+        reply_markup = {
+            "inline_keyboard": keyboard
+        }
 
         message_id = session.get("message_id")
 
@@ -1700,38 +1720,22 @@ async def render_welfare_selection(chat_id: str):
                 reply_markup,
             )
 
-            # اگر پیام دیگر قابل ویرایش نبود، پیام جدید بساز
-            if not result.get("ok", True):
-                result = await send_message(
-                    chat_id,
-                    text,
-                    reply_markup,
-                )
+            if isinstance(result, dict) and result.get("ok"):
+                return
 
-                new_message_id = (
-                    result.get("result", {}).get("message_id")
-                    if isinstance(result, dict)
-                    else None
-                )
+        result = await send_message(
+            chat_id,
+            text,
+            reply_markup,
+        )
 
-                if new_message_id:
-                    session["message_id"] = new_message_id
-
-        else:
-            result = await send_message(
-                chat_id,
-                text,
-                reply_markup,
-            )
-
-            message_id = (
+        if isinstance(result, dict):
+            new_message_id = (
                 result.get("result", {}).get("message_id")
-                if isinstance(result, dict)
-                else None
             )
 
-            if message_id:
-                session["message_id"] = message_id
+            if new_message_id:
+                session["message_id"] = new_message_id
 
     finally:
         db.close()
@@ -1748,32 +1752,36 @@ async def send_welfare_date_menu(chat_id: str):
     finally:
         db.close()
 
-    date_row = []
+    rows = []
 
     if today_ok:
-        date_row.append({
-            "text": "1️⃣ امروز",
-            "callback_data": "welfare_date:1",
-        })
+        rows.append(["1️⃣ امروز"])
 
     if tomorrow_ok:
-        date_row.append({
-            "text": "2️⃣ فردا",
-            "callback_data": "welfare_date:2",
-        })
+        rows.append(["2️⃣ فردا"])
 
-    if not date_row:
+    rows.append(["🔙 بازگشت", "🏠 منوی اصلی"])
+
+    if not today_ok and not tomorrow_ok:
         await send_message(
             chat_id,
             "⛔ مهلت ثبت سفارش برای امروز و فردا به پایان رسیده است.",
-            reply_markup=with_nav_row([], back=False),
+            reply_markup={
+                "keyboard": [["🔙 بازگشت", "🏠 منوی اصلی"]],
+                "resize_keyboard": True,
+                "one_time_keyboard": False,
+            },
         )
         return
 
     await send_message(
         chat_id,
         "👨‍💼 ثبت سفارش گروهی\n\nبرای چه روزی می‌خواهید سفارش ثبت کنید؟",
-        reply_markup=with_nav_row([date_row], back=False),
+        reply_markup={
+            "keyboard": rows,
+            "resize_keyboard": True,
+            "one_time_keyboard": False,
+        },
     )
 
 
@@ -1823,6 +1831,11 @@ async def handle_welfare_date_choice(chat_id: str, value: str):
 
     if not session or session.get("state") != "welfare_choose_date":
         return False
+
+    if value == "1️⃣ امروز":
+        value = "1"
+    elif value == "2️⃣ فردا":
+        value = "2"
 
     if value not in {"1", "2"}:
         return True
@@ -2709,6 +2722,7 @@ async def bale_webhook(request: Request):
     # ادامه وضعیت‌های مکالمه
     handlers = [
         handle_order_date_choice,
+        handle_welfare_date_choice,
         handle_order_food_choice,
         handle_order_quantity,
         handle_order_confirm,
