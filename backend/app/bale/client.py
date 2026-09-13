@@ -1,11 +1,10 @@
 import httpx
-
 from app.config import settings
 
 BASE_URL = f"https://tapi.bale.ai/bot{settings.BALE_BOT_TOKEN}"
 
 
-async def send_message(chat_id: str, text: str, reply_markup: dict | None = None):
+async def send_message(chat_id: str | int, text: str, reply_markup: dict | None = None):
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = reply_markup
@@ -14,7 +13,21 @@ async def send_message(chat_id: str, text: str, reply_markup: dict | None = None
         return resp.json()
 
 
-async def request_contact(chat_id: str, text: str):
+async def edit_message_text(chat_id: str | int, message_id: int, text: str, reply_markup: dict | None = None):
+    """ویرایش متن و کیبورد پیام قبلی در بله برای جلوگیری از تکرار پیام"""
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(f"{BASE_URL}/editMessageText", json=payload)
+        return resp.json()
+
+
+async def request_contact(chat_id: str | int, text: str):
     reply_markup = {
         "keyboard": [
             [{"text": "ارسال شماره موبایل من", "request_contact": True}]
@@ -25,7 +38,7 @@ async def request_contact(chat_id: str, text: str):
     return await send_message(chat_id, text, reply_markup=reply_markup)
 
 
-async def remove_keyboard(chat_id: str, text: str):
+async def remove_keyboard(chat_id: str | int, text: str):
     return await send_message(chat_id, text, reply_markup={"remove_keyboard": True})
 
 
