@@ -1,3 +1,4 @@
+import asyncio
 import random
 
 import jdatetime
@@ -10,6 +11,7 @@ from sqlalchemy import func
 
 from app.bale.client import (
     answer_callback_query,
+    delete_message,
     edit_message_text,
     main_menu_keyboard,
     remove_keyboard,
@@ -32,6 +34,27 @@ from app.models import (
 router = APIRouter()
 
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
+
+
+async def _delete_later(chat_id, message_id, delay: float = 0.05):
+    """حذف پیام کاربر بعد از تاخیر کوتاه (برای فلوی welfare)."""
+    await asyncio.sleep(delay)
+    try:
+        await delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+
+_WELFARE_LOCKS: dict = {}
+
+
+def _get_welfare_lock(chat_id):
+    key = str(chat_id)
+    lock = _WELFARE_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _WELFARE_LOCKS[key] = lock
+    return lock
 
 # وضعیت موقت مکالمه هر کاربر
 SESSIONS: dict[str, dict] = {}
@@ -1664,6 +1687,14 @@ async def render_welfare_selection(chat_id: str):
         selected = session.setdefault("selected", {})
         active_food_id = session.get("active_food_id")
 
+        # قفل per-chat برای جلوگیری از race در فشار سریع ➕/➖
+        _lock = _get_welfare_lock(chat_id)
+        await _lock.acquire()
+        try:
+            pass
+        finally:
+            pass
+
         menu_entries = (
             db.query(MenuEntry)
             .filter(MenuEntry.id.in_(options))
@@ -1724,95 +1755,78 @@ async def render_welfare_selection(chat_id: str):
                 "ابتدا غذا را انتخاب کنید.",
             ])
 
-        keyboard = []
+        # شمارش تکرار نام غذاها برای تفکیک نام‌های تکراری
+        name_counts = {}
+        for entry in menu_entries:
+            base = entry.food.name
+            name_counts[base] = name_counts.get(base, 0) + 1
+
+        name_seen = {}
+        food_labels = []
+        food_name_map = {}
 
         for entry in menu_entries:
+            base = entry.food.name
+            name_seen[base] = name_seen.get(base, 0) + 1
+
+            if name_counts[base] > 1:
+                display_name = f"{base} #{name_seen[base]}"
+            else:
+                display_name = base
+
             qty = selected.get(entry.id, 0)
 
             if qty:
-                button_text = f"✅ {entry.food.name} ({qty})"
+                label = f"🍽 {display_name} ({qty})"
             else:
-                button_text = f"🍽 {entry.food.name}"
+                label = f"🍽 {display_name}"
 
-            keyboard.append([
-                {
-                    "text": button_text,
-                    "callback_data": f"welfare_food:{entry.id}",
-                }
-            ])
+            food_labels.append(label)
+            food_name_map[label] = entry.id
+
+        session["food_name_map"] = food_name_map
+
+        keyboard_rows = chunk_keyboard_labels(food_labels, min_columns=3, max_columns=3)
 
         if active_food_id and active_food_id in entry_map:
-            keyboard.append([
-                {
-                    "text": "➖",
-                    "callback_data": f"welfare_minus:{active_food_id}",
-                },
-                {
-                    "text": f"🔢 {selected.get(active_food_id, 0)}",
-                    "callback_data": f"welfare_qty:{active_food_id}",
-                },
-                {
-                    "text": "➕",
-                    "callback_data": f"welfare_plus:{active_food_id}",
-                },
-            ])
+            keyboard_rows.append(["➖", "✍️ ورود تعداد", "➕"])
 
-            keyboard.append([
-                {
-                    "text": "✍️ ورود تعداد",
-                    "callback_data": f"welfare_qty:{active_food_id}",
-                },
-                {
-                    "text": "🗑 حذف",
-                    "callback_data": f"welfare_remove:{active_food_id}",
-                },
-            ])
-
+        extra_actions = []
+        if active_food_id and active_food_id in entry_map:
+            extra_actions.append("🗑 حذف")
         if selected:
-            keyboard.append([
-                {
-                    "text": "✅ ثبت سفارش",
-                    "callback_data": "welfare_submit:1",
-                }
-            ])
-
-        keyboard.append([
-            NAV_BACK_BUTTON,
-            NAV_HOME_BUTTON,
-        ])
+            extra_actions.append("✅ ثبت سفارش")
+        extra_actions.append("🔙 بازگشت")
+        extra_actions.append("🏠 منوی اصلی")
+        keyboard_rows.append(extra_actions)
 
         text = "\n".join(lines)
 
-        reply_markup = {
-            "inline_keyboard": keyboard
-        }
+        prev_msg_id = session.get("welfare_msg_id")
 
-        message_id = session.get("message_id")
-
-        if message_id:
-            result = await edit_message_text(
-                chat_id,
-                message_id,
-                text,
-                reply_markup,
-            )
-
-            if isinstance(result, dict) and result.get("ok"):
-                return
-
+        # اول پیام جدید را بفرست (تا کیبورد جدید فورا فعال شود)
         result = await send_message(
             chat_id,
             text,
-            reply_markup,
+            reply_markup={
+                "keyboard": keyboard_rows,
+                "resize_keyboard": True,
+                "one_time_keyboard": False,
+            },
         )
 
+        new_id = None
         if isinstance(result, dict):
-            new_message_id = (
-                result.get("result", {}).get("message_id")
-            )
+            new_id = result.get("result", {}).get("message_id")
+            if new_id:
+                session["welfare_msg_id"] = new_id
 
-            if new_message_id:
-                session["message_id"] = new_message_id
+        # بعد پیام قبلی را حذف کن
+        if prev_msg_id and prev_msg_id != new_id:
+            try:
+                await delete_message(chat_id, prev_msg_id)
+            except Exception:
+                pass
 
     finally:
         db.close()
@@ -1829,13 +1843,18 @@ async def send_welfare_date_menu(chat_id: str):
     finally:
         db.close()
 
-    rows = []
+    date_buttons = []
 
     if today_ok:
-        rows.append(["1️⃣ امروز"])
+        date_buttons.append("1️⃣ امروز")
 
     if tomorrow_ok:
-        rows.append(["2️⃣ فردا"])
+        date_buttons.append("2️⃣ فردا")
+
+    rows = []
+
+    if date_buttons:
+        rows.append(date_buttons)
 
     rows.append(["🔙 بازگشت", "🏠 منوی اصلی"])
 
@@ -2052,49 +2071,31 @@ async def handle_welfare_quantity_request(chat_id: str, value: str):
     session["active_food_id"] = entry_id
     session["state"] = "welfare_waiting_quantity"
 
-    message_id = session.get("message_id")
+    prev_msg_id = session.get("welfare_msg_id")
 
-    prompt = (
+    result = await send_message(
+        chat_id,
         "🔢 تعداد سفارش را وارد کنید.\n\n"
         "مثلاً: 80\n\n"
-        "⬅️ برای برگشت، از دکمه‌های پایین استفاده کنید."
+        "⬅️ برای برگشت، از دکمه‌های پایین استفاده کنید.",
+        reply_markup={
+            "keyboard": [["🔙 بازگشت", "🏠 منوی اصلی"]],
+            "resize_keyboard": True,
+            "one_time_keyboard": False,
+        },
     )
 
-    if message_id:
-        result = await edit_message_text(
-            chat_id,
-            message_id,
-            prompt,
-            {
-                "inline_keyboard": [
-                    [
-                        NAV_BACK_BUTTON,
-                        NAV_HOME_BUTTON,
-                    ]
-                ]
-            },
-        )
+    new_id = None
+    if isinstance(result, dict):
+        new_id = result.get("result", {}).get("message_id")
+        if new_id:
+            session["welfare_msg_id"] = new_id
 
-        if not result.get("ok", True):
-            await send_message(chat_id, prompt)
-    else:
-        result = await send_message(
-            chat_id,
-            prompt,
-            {
-                "inline_keyboard": [
-                    [
-                        NAV_BACK_BUTTON,
-                        NAV_HOME_BUTTON,
-                    ]
-                ]
-            },
-        )
-
-        if isinstance(result, dict):
-            new_message_id = result.get("result", {}).get("message_id")
-            if new_message_id:
-                session["message_id"] = new_message_id
+    if prev_msg_id and prev_msg_id != new_id:
+        try:
+            await delete_message(chat_id, prev_msg_id)
+        except Exception:
+            pass
 
 
 async def handle_welfare_plus(chat_id: str, value: str):
@@ -2271,9 +2272,32 @@ async def handle_welfare_submit(chat_id: str):
                 f"🔖 کد پیگیری: {code}"
             )
 
+        prev_msg_id = session.get("welfare_msg_id")
+
         clear_session(chat_id)
 
-        await send_message(chat_id, "\n".join(lines))
+        is_admin = employee.role in ADMIN_ROLES
+        is_welfare_manager = (
+            db.query(WelfareManagerAssignment)
+            .filter(
+                WelfareManagerAssignment.employee_id == employee.id,
+                WelfareManagerAssignment.is_active == True,  # noqa: E712
+            )
+            .first()
+            is not None
+        )
+
+        await send_message(
+            chat_id,
+            "\n".join(lines),
+            reply_markup=main_menu_keyboard(is_admin, is_welfare_manager),
+        )
+
+        if prev_msg_id:
+            try:
+                await delete_message(chat_id, prev_msg_id)
+            except Exception:
+                pass
 
     except Exception:
         db.rollback()
@@ -2334,6 +2358,61 @@ async def handle_welfare_quantities(chat_id: str, text: str):
     await render_welfare_selection(chat_id)
 
     return True
+
+
+async def handle_welfare_reply_action(chat_id: str, text: str) -> bool:
+    """مسیریابی دکمه‌های reply keyboard در حالت welfare_select."""
+    session = SESSIONS.get(str(chat_id))
+
+    if not session or session.get("state") != "welfare_select":
+        return False
+
+    text = (text or "").strip()
+    active_food_id = session.get("active_food_id")
+
+    if text == "➕":
+        if not active_food_id:
+            return False
+        await handle_welfare_plus(chat_id, str(active_food_id))
+        return True
+
+    if text == "➖":
+        if not active_food_id:
+            return False
+        await handle_welfare_minus(chat_id, str(active_food_id))
+        return True
+
+    if text == "🗑 حذف":
+        if not active_food_id:
+            return False
+        await handle_welfare_remove(chat_id, str(active_food_id))
+        return True
+
+    if text == "✍️ ورود تعداد":
+        if not active_food_id:
+            return False
+        await handle_welfare_quantity_request(chat_id, str(active_food_id))
+        return True
+
+    if text == "✅ ثبت سفارش":
+        await handle_welfare_submit(chat_id)
+        return True
+
+    food_name_map = session.get("food_name_map") or {}
+
+    if text in food_name_map:
+        entry_id = food_name_map[text]
+        selected = session.setdefault("selected", {})
+
+        if entry_id not in selected:
+            selected[entry_id] = 1
+
+        session["active_food_id"] = entry_id
+
+        await render_welfare_selection(chat_id)
+        return True
+
+    return False
 
 
 # ADMIN MENU
@@ -2732,6 +2811,13 @@ async def bale_webhook(request: Request):
     contact = message.get("contact")
     text = (message.get("text") or "").strip()
 
+    # حذف خودکار پیام کاربر در فلوی welfare بعد از ۱.۵ ثانیه
+    _sess = SESSIONS.get(str(chat_id))
+    if _sess and str(_sess.get("state", "")).startswith("welfare"):
+        _mid = message.get("message_id")
+        if _mid:
+            asyncio.create_task(_delete_later(chat_id, _mid, 0.05))
+
     if text == "🔙 بازگشت":
         await handle_nav(chat_id, "back")
         return {"ok": True}
@@ -2811,6 +2897,7 @@ async def bale_webhook(request: Request):
         handle_increase_quantity,
         handle_cancel_choice,
         handle_welfare_quantities,
+        handle_welfare_reply_action,
         handle_menu_site_choice,
         handle_menu_food_choice,
     ]
