@@ -45,6 +45,7 @@ BUTTON_COMMANDS = {
     "👨‍💼 سفارش گروهی": "/welfare",
     "⚙️ مدیریت منو": "/menu",
     "📊 گزارش": "/report",
+    "⚙️ مدیریت سیستم": "/sysadmin",
     "ℹ️ راهنما": "/help",
 }
 
@@ -458,6 +459,50 @@ async def handle_help(chat_id: str):
         "/report - گزارش آشپزخانه امروز\n"
         "/help - راهنما",
     )
+
+
+async def handle_sysadmin(chat_id: str):
+    db = SessionLocal()
+    try:
+        employee = (
+            db.query(Employee)
+            .filter(Employee.bale_chat_id == str(chat_id))
+            .first()
+        )
+        if not employee:
+            await send_message(
+                chat_id,
+                "ابتدا باید شناسایی شوید. لطفاً دستور /start را ارسال کنید.",
+            )
+            return
+
+        if employee.role not in ADMIN_ROLES:
+            await send_message(chat_id, "شما دسترسی به مدیریت سیستم ندارید.")
+            return
+
+        is_welfare_manager = (
+            db.query(WelfareManagerAssignment)
+            .filter(
+                WelfareManagerAssignment.employee_id == employee.id,
+                WelfareManagerAssignment.is_active == True,  # noqa: E712
+            )
+            .first()
+            is not None
+        )
+
+        await send_message(
+            chat_id,
+            "🔧 بخش «مدیریت سیستم» در حال ساخت است.\n\n"
+            "به‌زودی در این بخش:\n"
+            "• مدیریت پرسنل\n"
+            "• مدیریت سایت‌ها\n"
+            "• تنظیمات سیستم\n"
+            "• پشتیبان‌گیری خودکار\n\n"
+            "از دکمه‌های زیر می‌توانید فعلاً استفاده کنید 👇",
+            reply_markup=main_menu_keyboard(True, is_welfare_manager),
+        )
+    finally:
+        db.close()
 
 
 # =========================================================
@@ -2749,6 +2794,11 @@ async def bale_webhook(request: Request):
     if text == "/report":
         clear_session(chat_key)
         await handle_report(chat_id)
+        return {"ok": True}
+
+    if text == "/sysadmin":
+        clear_session(chat_key)
+        await handle_sysadmin(chat_id)
         return {"ok": True}
 
     # ادامه وضعیت‌های مکالمه

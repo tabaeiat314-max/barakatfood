@@ -30,14 +30,25 @@ async def remove_keyboard(chat_id: str | int, text: str):
 
 def main_menu_keyboard(is_admin: bool, is_welfare_manager: bool) -> dict:
     rows = [
-        [{"text": "🍽 سفارش"}, {"text": "📋 سفارش‌های من"}],
-        [{"text": "❌ لغو سفارش"}],
+        [
+            {"text": "🍽 سفارش"},
+            {"text": "📋 سفارش‌های من"},
+            {"text": "❌ لغو سفارش"},
+        ],
     ]
     if is_welfare_manager or is_admin:
-        rows.append([{"text": "👨‍💼 سفارش گروهی"}])
+        rows.append([
+            {"text": "👨‍💼 سفارش گروهی"},
+            {"text": "ℹ️ راهنما"},
+        ])
+    else:
+        rows.append([{"text": "ℹ️ راهنما"}])
     if is_admin:
-        rows.append([{"text": "⚙️ مدیریت منو"}, {"text": "📊 گزارش"}])
-    rows.append([{"text": "ℹ️ راهنما"}])
+        rows.append([
+            {"text": "⚙️ مدیریت منو"},
+            {"text": "📊 گزارش"},
+            {"text": "⚙️ مدیریت سیستم"},
+        ])
     return {
         "keyboard": rows,
         "resize_keyboard": True,
