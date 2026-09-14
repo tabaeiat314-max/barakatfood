@@ -964,14 +964,14 @@ async def handle_order_quantity(chat_id: str, text: str):
             f"📅 تاریخ: {to_jalali(target_date)}\n"
             f"🍽 غذا: {entry.food.name}\n"
             f"🔢 تعداد: {quantity}",
-            reply_markup=with_nav_row(
-                [
-                    [
-                        {"text": "✅ تأیید", "callback_data": "order_confirm:1"},
-                        {"text": "❌ انصراف", "callback_data": "order_confirm:2"},
-                    ]
-                ]
-            ),
+            reply_markup={
+                "keyboard": [
+                    ["✅ تأیید", "❌ انصراف"],
+                    ["🏠 منوی اصلی"],
+                ],
+                "resize_keyboard": True,
+                "one_time_keyboard": False,
+            },
         )
 
         session["state"] = "order_confirm"
@@ -994,21 +994,14 @@ async def handle_order_confirm(chat_id: str, text: str):
 
     value = text.strip()
 
-    if value == "2":
-        clear_session(chat_id)
-
-        await send_message(
-            chat_id,
-            "ثبت سفارش لغو شد.",
-        )
-        return True
-
-    if value != "1":
-        await send_message(
-            chat_id,
-            "لطفاً 1 برای تأیید یا 2 برای انصراف ارسال کنید.",
-        )
-        return True
+    # نرمال‌سازی: حذف ایموجی و نیم‌فاصله برای مقایسه‌ی مقاوم
+    norm = re.sub(r"[^\w]", "", value, flags=re.UNICODE)
+    confirm_kw = "\u062a\u0623\u06cc\u06cc\u062f"  # تأیید
+    cancel_kw = "\u0627\u0646\u0635\u0631\u0627\u0641"  # انصراف
+    if norm == confirm_kw or value == "1":
+        value = "1"
+    elif norm == cancel_kw or value == "2":
+        value = "2"
 
     db = SessionLocal()
 
@@ -1018,6 +1011,40 @@ async def handle_order_confirm(chat_id: str, text: str):
             .filter(Employee.id == session["employee_id"])
             .first()
         )
+
+        if employee:
+            is_admin = employee.role in ADMIN_ROLES
+            is_welfare_manager = (
+                db.query(WelfareManagerAssignment)
+                .filter(
+                    WelfareManagerAssignment.employee_id == employee.id,
+                    WelfareManagerAssignment.is_active == True,  # noqa: E712
+                )
+                .first()
+                is not None
+            )
+        else:
+            is_admin = False
+            is_welfare_manager = False
+
+        main_kb = main_menu_keyboard(is_admin, is_welfare_manager)
+
+        if value == "2":
+            clear_session(chat_id)
+            await send_message(
+                chat_id,
+                "ثبت سفارش لغو شد.",
+                reply_markup=main_kb,
+            )
+            return True
+
+        if value != "1":
+            await send_message(
+                chat_id,
+                "لطفاً از دکمه‌های «✅ تأیید» یا «❌ انصراف» استفاده کنید.",
+                reply_markup=main_kb,
+            )
+            return True
 
         entry = (
             db.query(MenuEntry)
@@ -1029,6 +1056,7 @@ async def handle_order_confirm(chat_id: str, text: str):
             await send_message(
                 chat_id,
                 "اطلاعات سفارش ناقص است.",
+                reply_markup=main_kb,
             )
             clear_session(chat_id)
             return True
@@ -1040,6 +1068,7 @@ async def handle_order_confirm(chat_id: str, text: str):
             await send_message(
                 chat_id,
                 "مهلت ثبت سفارش به پایان رسیده است.",
+                reply_markup=main_kb,
             )
             clear_session(chat_id)
             return True
@@ -1060,6 +1089,7 @@ async def handle_order_confirm(chat_id: str, text: str):
                 chat_id,
                 f"این سفارش قبلاً ثبت شده است.\n"
                 f"کد پیگیری: {existing.tracking_code}",
+                reply_markup=main_kb,
             )
             clear_session(chat_id)
             return True
@@ -1076,6 +1106,7 @@ async def handle_order_confirm(chat_id: str, text: str):
                 f"🍽 غذا: {entry.food.name}\n"
                 f"🔢 تعداد: {quantity}\n"
                 f"🎫 کد پیگیری: {existing.tracking_code}",
+                reply_markup=main_kb,
             )
         else:
             tracking_code = make_code(
@@ -1105,6 +1136,7 @@ async def handle_order_confirm(chat_id: str, text: str):
                 f"🍽 غذا: {entry.food.name}\n"
                 f"🔢 تعداد: {quantity}\n"
                 f"🎫 کد پیگیری: {tracking_code}",
+                reply_markup=main_kb,
             )
 
     finally:
