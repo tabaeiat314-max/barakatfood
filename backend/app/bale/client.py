@@ -68,6 +68,23 @@ async def edit_message_text(
         return resp.json()
 
 
+async def delete_message(
+    chat_id: str | int,
+    message_id: int | str,
+):
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+    }
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(
+            f"{BASE_URL}/deleteMessage",
+            json=payload,
+        )
+        return resp.json()
+
+
 async def answer_callback_query(callback_query_id: str, text: str | None = None):
     payload = {"callback_query_id": callback_query_id}
     if text:
