@@ -1870,7 +1870,7 @@ async def send_welfare_date_menu(chat_id: str):
         )
         return
 
-    await send_message(
+    result = await send_message(
         chat_id,
         "👨‍💼 ثبت سفارش گروهی\n\nبرای چه روزی می‌خواهید سفارش ثبت کنید؟",
         reply_markup={
@@ -1879,6 +1879,11 @@ async def send_welfare_date_menu(chat_id: str):
             "one_time_keyboard": False,
         },
     )
+
+    if isinstance(result, dict):
+        new_id = result.get("result", {}).get("message_id")
+        if new_id:
+            SESSIONS.setdefault(str(chat_id), {})["welfare_msg_id"] = new_id
 
 
 async def handle_welfare(chat_id: str):
