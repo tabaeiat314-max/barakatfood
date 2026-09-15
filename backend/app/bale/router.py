@@ -2461,7 +2461,7 @@ async def handle_welfare_submit(chat_id: str):
             is not None
         )
 
-        await send_message(
+        _sr = await send_message(
             chat_id,
             "\n".join(lines),
             reply_markup=main_menu_keyboard(is_admin, is_welfare_manager),
@@ -2473,6 +2473,12 @@ async def handle_welfare_submit(chat_id: str):
                     await delete_message(chat_id, mid)
                 except Exception:
                     pass
+
+        # حذف پیام موفقیت بعد از ۳.۵ ثانیه (تا کاربر ببیند، بعد پاک شود)
+        if isinstance(_sr, dict):
+            _sid = _sr.get("result", {}).get("message_id")
+            if _sid:
+                asyncio.create_task(_delete_later(chat_id, _sid, 3.5))
 
     except Exception:
         db.rollback()
