@@ -579,13 +579,12 @@ async def handle_help(chat_id: str):
 
 
 async def handle_sysadmin(chat_id: str):
+    # پاک کردن پیام‌های قبلی menu/sysadmin
+    await _delete_menu_msgs(chat_id)
+
     db = SessionLocal()
     try:
-        employee = (
-            db.query(Employee)
-            .filter(Employee.bale_chat_id == str(chat_id))
-            .first()
-        )
+        employee = get_employee(chat_id, db)
         if not employee:
             await send_message(
                 chat_id,
@@ -597,29 +596,894 @@ async def handle_sysadmin(chat_id: str):
             await send_message(chat_id, "شما دسترسی به مدیریت سیستم ندارید.")
             return
 
-        is_welfare_manager = (
-            db.query(WelfareManagerAssignment)
-            .filter(
-                WelfareManagerAssignment.employee_id == employee.id,
-                WelfareManagerAssignment.is_active == True,  # noqa: E712
+        SESSIONS[str(chat_id)] = {
+            "state": "sysadmin_menu",
+            "employee_id": employee.id,
+        }
+    finally:
+        db.close()
+
+    await show_sysadmin_menu(chat_id)
+
+
+async def _sysadmin_send_screen(chat_id, text, reply_markup=None):
+    """ارسال صفحه‌ی sysadmin — صفحه‌ی قبلی حذف می‌شود."""
+    session = SESSIONS.get(str(chat_id))
+    prev = session.get("sysadmin_last_id") if session else None
+    print(f"[DBG-SYS] chat={chat_id} prev={prev}", flush=True)
+
+    r = await send_message(chat_id, text, reply_markup)
+    new_id = None
+    if isinstance(r, dict):
+        new_id = r.get("result", {}).get("message_id")
+    print(f"[DBG-SYS] new_id={new_id}", flush=True)
+
+    if prev and prev != new_id:
+        try:
+            dr = await delete_message(chat_id, prev)
+            print(f"[DBG-SYS] deleted prev={prev} result={dr}", flush=True)
+        except Exception as e:
+            print(f"[DBG-SYS] delete error: {e}", flush=True)
+
+    if session is not None and new_id:
+        session["sysadmin_last_id"] = new_id
+        _track_menu_msg(chat_id, new_id)
+
+    return r
+
+
+async def show_sysadmin_menu(chat_id: str):
+    session = SESSIONS.get(str(chat_id))
+    if session is not None:
+        session["state"] = "sysadmin_menu"
+
+    await _sysadmin_send_screen(
+        chat_id,
+        "⚙️ مدیریت سیستم\n\n"
+        "بخش مورد نظر را از دکمه‌های پایین انتخاب کنید 👇",
+        reply_markup={
+            "keyboard": [
+                ["👥 مدیریت پرسنل", "🏢 مدیریت سایت‌ها"],
+                ["⏰ تنظیمات", "💾 بکاپ"],
+                ["🏠 منوی اصلی"],
+            ],
+            "resize_keyboard": True,
+            "one_time_keyboard": False,
+        },
+    )
+
+
+async def show_personnel_list(
+    chat_id: str,
+    page: int = 1,
+    query: str | None = None,
+    filter_site_id: int | None = None,
+    filter_role: str | None = None,
+    reset_filters: bool = False,
+):
+    session = SESSIONS.get(str(chat_id))
+    if session is None:
+        return
+
+    per_page = 10
+
+    if reset_filters:
+        filter_site_id = None
+        filter_role = None
+
+    if filter_site_id is None and not reset_filters:
+        filter_site_id = session.get("personnel_filter_site_id")
+    if filter_role is None and not reset_filters:
+        filter_role = session.get("personnel_filter_role")
+
+    session["personnel_filter_site_id"] = filter_site_id
+    session["personnel_filter_role"] = filter_role
+
+    db = SessionLocal()
+    try:
+        q = db.query(Employee)
+        if query:
+            q = q.filter(
+                (Employee.full_name.ilike(f"%{query}%"))
+                | (Employee.mobile.ilike(f"%{query}%"))
             )
-            .first()
-            is not None
+        if filter_site_id:
+            q = q.filter(Employee.site_id == filter_site_id)
+        if filter_role:
+            q = q.filter(Employee.role == filter_role)
+
+        total = q.count()
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        if page < 1:
+            page = 1
+        if page > total_pages:
+            page = total_pages
+
+        employees = (
+            q.order_by(Employee.id)
+            .offset((page - 1) * per_page)
+            .limit(per_page)
+            .all()
         )
 
-        await send_message(
+        # ساخت header با اطلاعات فیلترها
+        active_filters = []
+        if query:
+            active_filters.append(f"🔍 «{query}»")
+        if filter_site_id:
+            site_obj = db.query(Site).filter(Site.id == filter_site_id).first()
+            if site_obj:
+                active_filters.append(f"🏢 {site_obj.name}")
+        if filter_role:
+            active_filters.append(f"🎭 {filter_role}")
+
+        if active_filters:
+            header = f"🔎 فیلترها: {' + '.join(active_filters)} — کل: {total} نفر"
+        else:
+            header = f"👥 لیست پرسنل — کل: {total} نفر"
+
+        lines = [header, f"📄 صفحه {page} از {total_pages}", ""]
+
+        index_map = {}
+        if not employees:
+            lines.append("نتیجه‌ای یافت نشد.")
+        else:
+            for idx, e in enumerate(employees, start=1):
+                status = "✅" if e.is_active else "🚫"
+                site_name = e.site.name if e.site else "—"
+                index_map[str(idx)] = e.id
+                lines.append(f"{idx}. {status} {e.full_name}")
+                lines.append(
+                    f"   📱 {e.mobile or '—'} | {e.role} | {site_name}"
+                )
+                lines.append("")
+
+        session["state"] = "sysadmin_personnel_list"
+        session["personnel_index_map"] = index_map
+        session["personnel_current_page"] = page
+        session["personnel_total_pages"] = total_pages
+        session["personnel_search_query"] = query
+
+        rows = []
+
+        # دکمه‌های صفحه‌بندی
+        nav = []
+        if page > 1:
+            nav.append("◀️ قبلی")
+        if page < total_pages:
+            nav.append("بعدی ▶️")
+        if nav:
+            rows.append(nav)
+
+        # دکمه‌های اصلی — جستجو + فیلتر در یک ردیف
+        if query:
+            rows.append(["🔄 جستجوی جدید", "📋 لیست کامل", "⚙️ فیلترها"])
+        else:
+            if active_filters:
+                rows.append(["🔍 جستجو", "⚙️ فیلترها (فعال)"])
+            else:
+                rows.append(["🔍 جستجو", "⚙️ فیلترها"])
+
+        rows.append(["✏️ ویرایش پرسنل", "➕ افزودن پرسنل"])
+        rows.append(["🏠 بازگشت به مدیریت"])
+
+        await _sysadmin_send_screen(
             chat_id,
-            "🔧 بخش «مدیریت سیستم» در حال ساخت است.\n\n"
-            "به‌زودی در این بخش:\n"
-            "• مدیریت پرسنل\n"
-            "• مدیریت سایت‌ها\n"
-            "• تنظیمات سیستم\n"
-            "• پشتیبان‌گیری خودکار\n\n"
-            "از دکمه‌های زیر می‌توانید فعلاً استفاده کنید 👇",
-            reply_markup=main_menu_keyboard(True, is_welfare_manager),
+            "\n".join(lines),
+            reply_markup={
+                "keyboard": rows,
+                "resize_keyboard": True,
+                "one_time_keyboard": False,
+            },
         )
     finally:
         db.close()
+
+
+async def show_filter_menu(chat_id: str):
+    session = SESSIONS.get(str(chat_id))
+    if session is None:
+        return
+
+    session["state"] = "sysadmin_p_filter_menu"
+
+    filter_site_id = session.get("personnel_filter_site_id")
+    filter_role = session.get("personnel_filter_role")
+
+    lines = ["⚙️ فیلترها", ""]
+    has_filter = False
+
+    if filter_site_id:
+        db = SessionLocal()
+        try:
+            s = db.query(Site).filter(Site.id == filter_site_id).first()
+            if s:
+                lines.append(f"🏢 سایت: {s.name}")
+                has_filter = True
+        finally:
+            db.close()
+
+    if filter_role:
+        lines.append(f"🎭 نقش: {filter_role}")
+        has_filter = True
+
+    if not has_filter:
+        lines.append("هیچ فیلتری فعال نیست.")
+        lines.append("")
+        lines.append("روی یکی از فیلترها بزنید تا اعمال شود.")
+    else:
+        lines.append("")
+        lines.append("برای حذف، «🗑 حذف فیلترها» را بزنید.")
+
+    rows = [
+        ["🏢 فیلتر سایت", "🎭 فیلتر نقش"],
+    ]
+    if has_filter:
+        rows.append(["🗑 حذف فیلترها"])
+    rows.append(["🔙 بازگشت به لیست"])
+
+    await _sysadmin_send_screen(
+        chat_id,
+        "\n".join(lines),
+        reply_markup={
+            "keyboard": rows,
+            "resize_keyboard": True,
+            "one_time_keyboard": False,
+        },
+    )
+
+
+async def show_filter_site_menu(chat_id: str):
+    session = SESSIONS.get(str(chat_id))
+    if session is None:
+        return
+
+    db = SessionLocal()
+    try:
+        sites = db.query(Site).filter(Site.is_active == True).order_by(Site.id).all()
+    finally:
+        db.close()
+
+    if not sites:
+        await send_message(chat_id, "⚠️ هیچ سایت فعالی وجود ندارد.")
+        await show_personnel_list(chat_id, page=1)
+        return
+
+    session["state"] = "sysadmin_p_filter_site"
+
+    rows = [[s.name] for s in sites]
+    rows.append(["🔙 انصراف"])
+
+    await _sysadmin_send_screen(
+        chat_id,
+        "🏢 انتخاب سایت برای فیلتر:",
+        reply_markup={
+            "keyboard": rows,
+            "resize_keyboard": True,
+            "one_time_keyboard": False,
+        },
+    )
+
+
+async def show_filter_role_menu(chat_id: str):
+    session = SESSIONS.get(str(chat_id))
+    if session is None:
+        return
+
+    session["state"] = "sysadmin_p_filter_role"
+
+    await _sysadmin_send_screen(
+        chat_id,
+        "🎭 انتخاب نقش برای فیلتر:",
+        reply_markup={
+            "keyboard": [
+                ["کارمند", "مسئول رفاهی"],
+                ["ادمین", "مدیر سیستم"],
+                ["🔙 انصراف"],
+            ],
+            "resize_keyboard": True,
+            "one_time_keyboard": False,
+        },
+    )
+
+
+async def show_personnel_edit_menu(chat_id: str):
+    session = SESSIONS.get(str(chat_id))
+    if session is None:
+        return
+
+    emp_id = session.get("edit_emp_id")
+    if emp_id is None:
+        await show_personnel_list(chat_id)
+        return
+
+    db = SessionLocal()
+    try:
+        emp = db.query(Employee).filter(Employee.id == emp_id).first()
+        if not emp:
+            await send_message(chat_id, "⚠️ پرسنل پیدا نشد.")
+            await show_personnel_list(chat_id)
+            return
+
+        site_name = emp.site.name if emp.site else "—"
+        status = "✅ فعال" if emp.is_active else "🚫 غیرفعال"
+
+        await _sysadmin_send_screen(
+            chat_id,
+            "✏️ ویرایش پرسنل:\n\n"
+            f"👤 نام: {emp.full_name}\n"
+            f"📱 موبایل: {emp.mobile or '—'}\n"
+            f"🎭 نقش: {emp.role}\n"
+            f"🏢 سایت: {site_name}\n"
+            f"📊 وضعیت: {status}",
+            reply_markup={
+                "keyboard": [
+                    ["✏️ تغییر نام", "📱 تغییر موبایل"],
+                    ["🎭 تغییر نقش", "🔄 فعال/غیرفعال"],
+                    ["🏠 بازگشت به لیست"],
+                ],
+                "resize_keyboard": True,
+                "one_time_keyboard": False,
+            },
+        )
+        session["state"] = "sysadmin_p_edit_menu"
+    finally:
+        db.close()
+
+
+async def handle_sysadmin_router(chat_id: str, text: str) -> bool:
+    """مسیریابی دکمه‌های مدیریت سیستم."""
+    session = SESSIONS.get(str(chat_id))
+    if not session:
+        return False
+
+    state = session.get("state", "")
+    if not state.startswith("sysadmin"):
+        return False
+
+    text = (text or "").strip()
+
+    # ============ زیرمنوی اصلی ============
+    if state == "sysadmin_menu":
+        if text == "👥 مدیریت پرسنل":
+            await show_personnel_list(chat_id)
+            return True
+        if text == "🏢 مدیریت سایت‌ها":
+            await send_message(chat_id, "🏢 بخش «مدیریت سایت‌ها» در حال ساخت است.")
+            return True
+        if text == "⏰ تنظیمات":
+            await send_message(chat_id, "⏰ بخش «تنظیمات» در حال ساخت است.")
+            return True
+        if text == "💾 بکاپ":
+            await send_message(chat_id, "💾 بخش «بکاپ» در حال ساخت است.")
+            return True
+        return False
+
+    # ============ لیست پرسنل ============
+    if state == "sysadmin_personnel_list":
+        cur_page = session.get("personnel_current_page", 1)
+        cur_query = session.get("personnel_search_query")
+
+        if text == "🏠 بازگشت به مدیریت":
+            await show_sysadmin_menu(chat_id)
+            return True
+
+        if text == "➕ افزودن پرسنل":
+            session["state"] = "sysadmin_p_add_name"
+            session["sysadmin_add"] = {}
+            await send_message(
+                chat_id,
+                "➕ افزودن پرسنل جدید\n\n"
+                "مرحله ۱ از ۴: نام کامل پرسنل را وارد کنید.",
+                reply_markup={
+                    "keyboard": [["🔙 انصراف"]],
+                    "resize_keyboard": True,
+                    "one_time_keyboard": False,
+                },
+            )
+            return True
+
+        if text == "✏️ ویرایش پرسنل":
+            imap = session.get("personnel_index_map", {}) or {}
+            if not imap:
+                await send_message(chat_id, "⚠️ لیست پرسنل خالی است.")
+                return True
+            session["state"] = "sysadmin_p_edit_choose"
+            await send_message(
+                chat_id,
+                "✏️ شماره پرسنل مورد ویرایش را وارد کنید (مثلاً 1).",
+                reply_markup={
+                    "keyboard": [["🔙 انصراف"]],
+                    "resize_keyboard": True,
+                    "one_time_keyboard": False,
+                },
+            )
+            return True
+
+        if text == "🔍 جستجو" or text == "🔄 جستجوی جدید":
+            session["state"] = "sysadmin_p_search"
+            await send_message(
+                chat_id,
+                "🔍 بخشی از نام یا شماره موبایل را تایپ کنید:",
+                reply_markup={
+                    "keyboard": [["🔙 انصراف"]],
+                    "resize_keyboard": True,
+                    "one_time_keyboard": False,
+                },
+            )
+            return True
+
+        if text == "📋 لیست کامل":
+            await show_personnel_list(chat_id, page=1, query=None)
+            return True
+
+        if text == "◀️ قبلی":
+            await show_personnel_list(chat_id, page=cur_page - 1, query=cur_query)
+            return True
+
+        if text == "بعدی ▶️":
+            await show_personnel_list(chat_id, page=cur_page + 1, query=cur_query)
+            return True
+
+        if text in ("⚙️ فیلترها", "⚙️ فیلترها (فعال)"):
+            await show_filter_menu(chat_id)
+            return True
+
+        return False
+
+    # ============ زیرمنوی فیلترها ============
+    if state == "sysadmin_p_filter_menu":
+        if text == "🏢 فیلتر سایت":
+            await show_filter_site_menu(chat_id)
+            return True
+        if text == "🎭 فیلتر نقش":
+            await show_filter_role_menu(chat_id)
+            return True
+        if text == "🗑 حذف فیلترها":
+            session["personnel_filter_site_id"] = None
+            session["personnel_filter_role"] = None
+            await show_filter_menu(chat_id)
+            return True
+        if text in ("🔙 بازگشت", "🔙 بازگشت به لیست"):
+            await show_personnel_list(chat_id, page=1)
+            return True
+        return False
+
+    # ============ فیلتر سایت ============
+    if state == "sysadmin_p_filter_site":
+        if text == "🔙 انصراف":
+            await show_filter_menu(chat_id)
+            return True
+
+        # اگر روی همان فیلتر فعلی بزند، حذف شود (toggle)
+        db = SessionLocal()
+        try:
+            site_obj = db.query(Site).filter(Site.name == text).first()
+        finally:
+            db.close()
+
+        if not site_obj:
+            await send_message(chat_id, "⚠️ لطفاً یکی از سایت‌های موجود را انتخاب کنید.")
+            return True
+
+        # toggle: اگر همین سایت قبلاً انتخاب شده بود، حذف کن
+        if session.get("personnel_filter_site_id") == site_obj.id:
+            session["personnel_filter_site_id"] = None
+        else:
+            session["personnel_filter_site_id"] = site_obj.id
+
+        # برگشت خودکار به زیرمنوی فیلتر (نه لیست)
+        await show_filter_menu(chat_id)
+        return True
+
+    # ============ فیلتر نقش ============
+    if state == "sysadmin_p_filter_role":
+        if text == "🔙 انصراف":
+            await show_filter_menu(chat_id)
+            return True
+
+        valid_roles = ("کارمند", "مسئول رفاهی", "ادمین", "مدیر سیستم")
+        if text not in valid_roles:
+            await send_message(chat_id, "⚠️ لطفاً یکی از نقش‌های موجود را انتخاب کنید.")
+            return True
+
+        # toggle: اگر همین نقش قبلاً انتخاب شده بود، حذف کن
+        if session.get("personnel_filter_role") == text:
+            session["personnel_filter_role"] = None
+        else:
+            session["personnel_filter_role"] = text
+
+        # برگشت خودکار به زیرمنوی فیلتر
+        await show_filter_menu(chat_id)
+        return True
+
+    # ============ جستجوی پرسنل ============
+    if state == "sysadmin_p_search":
+        q = text.strip()
+        if not q:
+            await send_message(chat_id, "⚠️ متن جستجو خالی است.")
+            return True
+        await show_personnel_list(chat_id, page=1, query=q)
+        return True
+
+    # ============ انصراف از افزودن ============
+    if text == "🔙 انصراف" and state.startswith("sysadmin_p_add_"):
+        session["sysadmin_add"] = {}
+        await show_personnel_list(chat_id)
+        return True
+
+    # ============ انصراف از جستجو ============
+    if text == "🔙 انصراف" and state == "sysadmin_p_search":
+        await show_personnel_list(chat_id, page=1, query=None)
+        return True
+
+    # ============ مرحله ۱: نام ============
+    if state == "sysadmin_p_add_name":
+        name = text.strip()
+        if not name:
+            await send_message(chat_id, "⚠️ نام نمی‌تواند خالی باشد.")
+            return True
+
+        session["sysadmin_add"]["full_name"] = name
+        session["state"] = "sysadmin_p_add_mobile"
+        await send_message(
+            chat_id,
+            f"✅ نام: {name}\n\n"
+            "مرحله ۲ از ۴: شماره موبایل را وارد کنید یا «رد کردن» بزنید.",
+            reply_markup={
+                "keyboard": [["⏭️ رد کردن", "🔙 انصراف"]],
+                "resize_keyboard": True,
+                "one_time_keyboard": False,
+            },
+        )
+        return True
+
+    # ============ مرحله ۳: موبایل ============
+    if state == "sysadmin_p_add_mobile":
+        if text == "⏭️ رد کردن":
+            session["sysadmin_add"]["mobile"] = None
+        else:
+            mobile = normalize_mobile(text)
+            if not mobile or len(mobile) < 10:
+                await send_message(chat_id, "⚠️ شماره موبایل نامعتبر است. دوباره وارد کنید یا «رد کردن» بزنید.")
+                return True
+
+            db = SessionLocal()
+            try:
+                exists = db.query(Employee).filter(Employee.mobile == mobile).first()
+                if exists:
+                    await send_message(chat_id, f"⚠️ موبایل «{mobile}» قبلاً ثبت شده است.")
+                    return True
+            finally:
+                db.close()
+
+            session["sysadmin_add"]["mobile"] = mobile
+
+        # نمایش لیست سایت‌ها
+        db = SessionLocal()
+        try:
+            sites = db.query(Site).filter(Site.is_active == True).order_by(Site.id).all()
+        finally:
+            db.close()
+
+        if not sites:
+            await send_message(chat_id, "⚠️ هیچ سایت فعالی وجود ندارد.")
+            await show_personnel_list(chat_id)
+            return True
+
+        session["sysadmin_add"]["site_options"] = {s.name: s.id for s in sites}
+        session["state"] = "sysadmin_p_add_site"
+
+        rows = [[s.name] for s in sites]
+        rows.append(["🔙 انصراف"])
+        await send_message(
+            chat_id,
+            "مرحله ۳ از ۴: سایت مورد نظر را انتخاب کنید 👇",
+            reply_markup={
+                "keyboard": rows,
+                "resize_keyboard": True,
+                "one_time_keyboard": False,
+            },
+        )
+        return True
+
+    # ============ مرحله ۴: انتخاب سایت ============
+    if state == "sysadmin_p_add_site":
+        site_options = session["sysadmin_add"].get("site_options", {})
+        if text not in site_options:
+            await send_message(chat_id, "⚠️ لطفاً یکی از سایت‌های موجود را انتخاب کنید.")
+            return True
+
+        session["sysadmin_add"]["site_id"] = site_options[text]
+        session["sysadmin_add"]["site_name"] = text
+        session["state"] = "sysadmin_p_add_role"
+
+        await send_message(
+            chat_id,
+            f"✅ سایت: {text}\n\n"
+            "مرحله ۴ از ۴: نقش را انتخاب کنید 👇",
+            reply_markup={
+                "keyboard": [
+                    ["کارمند", "مسئول رفاهی"],
+                    ["ادمین", "مدیر سیستم"],
+                    ["🔙 انصراف"],
+                ],
+                "resize_keyboard": True,
+                "one_time_keyboard": False,
+            },
+        )
+        return True
+
+    # ============ مرحله ۵: انتخاب نقش و ذخیره ============
+    if state == "sysadmin_p_add_role":
+        valid_roles = ("کارمند", "مسئول رفاهی", "ادمین", "مدیر سیستم")
+        if text not in valid_roles:
+            await send_message(chat_id, "⚠️ لطفاً یکی از نقش‌های موجود را انتخاب کنید.")
+            return True
+
+        add = session["sysadmin_add"]
+        is_wm = (text == "مسئول رفاهی")
+        actual_role = "کارمند" if is_wm else text
+
+        db = SessionLocal()
+        try:
+            # company_id پیش‌فرض
+            from app.models import Company
+            company = db.query(Company).first()
+            if not company:
+                await send_message(chat_id, "⚠️ هیچ شرکتی ثبت نشده است.")
+                return True
+
+            # تولید خودکار کد پرسنلی
+            import random as _rnd
+            personnel_code = None
+            for _ in range(50):
+                _c = "P-" + "".join(_rnd.choices(string.digits, k=6))
+                if not db.query(Employee).filter(Employee.personnel_code == _c).first():
+                    personnel_code = _c
+                    break
+            if personnel_code is None:
+                await send_message(chat_id, "⚠️ خطا در تولید کد پرسنلی.")
+                return True
+
+            emp = Employee(
+                personnel_code=personnel_code,
+                full_name=add["full_name"],
+                mobile=add.get("mobile"),
+                bale_chat_id=None,
+                company_id=company.id,
+                site_id=add["site_id"],
+                role=actual_role,
+                can_debug=False,
+                is_active=True,
+            )
+            db.add(emp)
+            db.flush()
+
+            if is_wm:
+                wm = WelfareManagerAssignment(
+                    employee_id=emp.id,
+                    site_id=add["site_id"],
+                    is_active=True,
+                )
+                db.add(wm)
+
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            await send_message(chat_id, f"⚠️ خطا در ذخیره: {e}")
+            return True
+        finally:
+            db.close()
+
+        session["sysadmin_add"] = {}
+
+        await send_message(
+            chat_id,
+            "✅ پرسنل با موفقیت اضافه شد:\n\n"
+            f"👤 {add['full_name']}\n"
+            f"📱 موبایل: {add.get('mobile') or '—'}\n"
+            f"🏢 سایت: {add['site_name']}\n"
+            f"🎭 نقش: {text}",
+        )
+        await show_personnel_list(chat_id)
+        return True
+
+    # ============ ویرایش پرسنل ============
+    if state == "sysadmin_p_edit_choose":
+        idx = text.strip()
+        imap = session.get("personnel_index_map", {}) or {}
+        if idx not in imap:
+            await send_message(chat_id, "⚠️ شماره نامعتبر است. دوباره وارد کنید یا «🔙 انصراف» بزنید.")
+            return True
+
+        emp_id = imap[idx]
+        session["edit_emp_id"] = emp_id
+        await show_personnel_edit_menu(chat_id)
+        return True
+
+    if state == "sysadmin_p_edit_menu":
+        emp_id = session.get("edit_emp_id")
+        if emp_id is None:
+            await show_personnel_list(chat_id)
+            return True
+
+        db = SessionLocal()
+        try:
+            emp = db.query(Employee).filter(Employee.id == emp_id).first()
+            if not emp:
+                await send_message(chat_id, "⚠️ پرسنل پیدا نشد.")
+                await show_personnel_list(chat_id)
+                return True
+        finally:
+            db.close()
+
+        if text == "🏠 بازگشت به لیست":
+            session.pop("edit_emp_id", None)
+            await show_personnel_list(chat_id)
+            return True
+
+        if text == "✏️ تغییر نام":
+            session["state"] = "sysadmin_p_edit_name"
+            await send_message(
+                chat_id,
+                f"نام فعلی: {emp.full_name}\n\nنام جدید را وارد کنید.",
+                reply_markup={
+                    "keyboard": [["🔙 انصراف"]],
+                    "resize_keyboard": True,
+                    "one_time_keyboard": False,
+                },
+            )
+            return True
+
+        if text == "📱 تغییر موبایل":
+            session["state"] = "sysadmin_p_edit_mobile"
+            await send_message(
+                chat_id,
+                f"موبایل فعلی: {emp.mobile or '—'}\n\nموبایل جدید را وارد کنید یا «⏭️ حذف» بزنید.",
+                reply_markup={
+                    "keyboard": [["⏭️ حذف", "🔙 انصراف"]],
+                    "resize_keyboard": True,
+                    "one_time_keyboard": False,
+                },
+            )
+            return True
+
+        if text == "🎭 تغییر نقش":
+            session["state"] = "sysadmin_p_edit_role"
+            await send_message(
+                chat_id,
+                f"نقش فعلی: {emp.role}\n\nنقش جدید را انتخاب کنید 👇",
+                reply_markup={
+                    "keyboard": [
+                        ["کارمند", "مسئول رفاهی"],
+                        ["ادمین", "مدیر سیستم"],
+                        ["🔙 انصراف"],
+                    ],
+                    "resize_keyboard": True,
+                    "one_time_keyboard": False,
+                },
+            )
+            return True
+
+        if text == "🔄 فعال/غیرفعال":
+            db = SessionLocal()
+            try:
+                emp = db.query(Employee).filter(Employee.id == emp_id).first()
+                if emp:
+                    emp.is_active = not emp.is_active
+                    db.commit()
+                    new_status = "✅ فعال" if emp.is_active else "🚫 غیرفعال"
+                else:
+                    new_status = "نامشخص"
+            finally:
+                db.close()
+            await send_message(chat_id, f"وضعیت جدید: {new_status}")
+            await show_personnel_edit_menu(chat_id)
+            return True
+
+        return False
+
+    # ============ ویرایش: نام ============
+    if state == "sysadmin_p_edit_name":
+        new_name = text.strip()
+        if not new_name:
+            await send_message(chat_id, "⚠️ نام نمی‌تواند خالی باشد.")
+            return True
+
+        emp_id = session.get("edit_emp_id")
+        db = SessionLocal()
+        try:
+            emp = db.query(Employee).filter(Employee.id == emp_id).first()
+            if emp:
+                emp.full_name = new_name
+                db.commit()
+        finally:
+            db.close()
+
+        await send_message(chat_id, f"✅ نام به «{new_name}» تغییر یافت.")
+        await show_personnel_edit_menu(chat_id)
+        return True
+
+    # ============ ویرایش: موبایل ============
+    if state == "sysadmin_p_edit_mobile":
+        if text == "⏭️ حذف":
+            new_mobile = None
+        else:
+            new_mobile = normalize_mobile(text)
+            if not new_mobile or len(new_mobile) < 10:
+                await send_message(chat_id, "⚠️ شماره نامعتبر است.")
+                return True
+
+            db = SessionLocal()
+            try:
+                dup = db.query(Employee).filter(
+                    Employee.mobile == new_mobile,
+                    Employee.id != session.get("edit_emp_id"),
+                ).first()
+                if dup:
+                    await send_message(chat_id, "⚠️ این شماره برای پرسنل دیگری ثبت شده است.")
+                    return True
+            finally:
+                db.close()
+
+        emp_id = session.get("edit_emp_id")
+        db = SessionLocal()
+        try:
+            emp = db.query(Employee).filter(Employee.id == emp_id).first()
+            if emp:
+                emp.mobile = new_mobile
+                db.commit()
+        finally:
+            db.close()
+
+        await send_message(chat_id, f"✅ موبایل به «{new_mobile or '—'}» تغییر یافت.")
+        await show_personnel_edit_menu(chat_id)
+        return True
+
+    # ============ ویرایش: نقش ============
+    if state == "sysadmin_p_edit_role":
+        valid_roles = ("کارمند", "مسئول رفاهی", "ادمین", "مدیر سیستم")
+        if text not in valid_roles:
+            await send_message(chat_id, "⚠️ لطفاً یکی از نقش‌های موجود را انتخاب کنید.")
+            return True
+
+        emp_id = session.get("edit_emp_id")
+        is_wm = (text == "مسئول رفاهی")
+        actual_role = "کارمند" if is_wm else text
+
+        db = SessionLocal()
+        try:
+            emp = db.query(Employee).filter(Employee.id == emp_id).first()
+            if emp:
+                emp.role = actual_role
+
+                # مدیریت WelfareManagerAssignment
+                existing_wm = db.query(WelfareManagerAssignment).filter(
+                    WelfareManagerAssignment.employee_id == emp_id,
+                ).first()
+
+                if is_wm and not existing_wm:
+                    wm = WelfareManagerAssignment(
+                        employee_id=emp_id,
+                        site_id=emp.site_id,
+                        is_active=True,
+                    )
+                    db.add(wm)
+                elif is_wm and existing_wm:
+                    existing_wm.is_active = True
+                elif not is_wm and existing_wm:
+                    existing_wm.is_active = False
+
+                db.commit()
+        finally:
+            db.close()
+
+        await send_message(chat_id, f"✅ نقش به «{text}» تغییر یافت.")
+        await show_personnel_edit_menu(chat_id)
+        return True
+
+    return False
 
 
 # =========================================================
@@ -3635,7 +4499,7 @@ async def bale_webhook(request: Request):
             _sess = SESSIONS.get(str(chat_id))
             if _sess:
                 _state = str(_sess.get("state", ""))
-                if _state.startswith(("welfare", "menu", "order")) or _state == "menu_done":
+                if _state.startswith(("welfare", "menu", "order", "sysadmin")) or _state == "menu_done":
                     _should_delete = True
         if _should_delete:
             try:
@@ -3730,6 +4594,7 @@ async def bale_webhook(request: Request):
         handle_welfare_date_choice,
         handle_menu_submit,
         handle_menu_site_choice,
+        handle_sysadmin_router,
     ]
 
     for handler in handlers:
