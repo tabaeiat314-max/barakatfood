@@ -21,5 +21,5 @@
   "otherPortsAttributes": {
     "onAutoForward": "ignore"
   },
-  "postCreateCommand": "echo 'Codespace آماده است. برای اجرا: docker compose up -d'"
+  "postStartCommand": "cd /workspaces/barakatfood && docker compose down --remove-orphans 2>/dev/null; docker compose up -d && echo '✅ Barakat backend is running'"
 }
