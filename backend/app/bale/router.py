@@ -3727,7 +3727,46 @@ async def bale_webhook(request: Request):
     ]
 
     for handler in handlers:
-        handled = await handler(chat_id, text)
+        try:
+            handled = await handler(chat_id, text)
+        except Exception as _e:
+            import traceback
+            traceback.print_exc()
+            print(f"[HANDLER-ERROR] {getattr(handler, '__name__', '?')}: {_e}", flush=True)
+
+            # state را ریست کن تا کاربر گیر نکند
+            clear_session(chat_id)
+
+            # نقش کاربر را برای کیبورد اصلی بگیر
+            _db = SessionLocal()
+            _is_admin = False
+            _is_wm = False
+            try:
+                _emp = get_employee(chat_id, _db)
+                if _emp:
+                    _is_admin = _emp.role in ADMIN_ROLES
+                    _is_wm = (
+                        _db.query(WelfareManagerAssignment)
+                        .filter(
+                            WelfareManagerAssignment.employee_id == _emp.id,
+                            WelfareManagerAssignment.is_active == True,  # noqa: E712
+                        )
+                        .first()
+                        is not None
+                    )
+            finally:
+                _db.close()
+
+            try:
+                await send_message(
+                    chat_id,
+                    "❌ متأسفانه خطایی رخ داد. لطفاً دوباره تلاش کنید.",
+                    reply_markup=main_menu_keyboard(_is_admin, _is_wm),
+                )
+            except Exception:
+                pass
+
+            return {"ok": True}
 
         if handled:
             return {"ok": True}
