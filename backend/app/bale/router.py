@@ -1,5 +1,6 @@
 import asyncio
 import random
+import time
 
 import jdatetime
 import re
@@ -235,9 +236,15 @@ def can_reduce_or_cancel(db, target_date: date) -> bool:
 
 
 def make_code(prefix: str, db, model) -> str:
-    for _ in range(20):
-        suffix = "".join(random.choices(string.digits, k=5))
-        code = f"{prefix}{today_iran().strftime('%Y%m%d')}{suffix}"
+    """کد پیگیری کوتاه: PREFIX-MMDD-NNNN (مثلاً W-0915-0042)."""
+    today = today_iran()
+    date_part = today.strftime("%m%d")
+
+    total = db.query(model).count()
+
+    for i in range(100):
+        seq = total + 1 + i
+        code = f"{prefix}-{date_part}-{seq:04d}"
 
         exists = (
             db.query(model)
@@ -1686,6 +1693,12 @@ async def _render_welfare_selection_impl(chat_id: str):
     if not session or session.get("state") != "welfare_select":
         return
 
+    # رفع پیام تکراری: اگر علامت «تازه برگشتیم از quantity» ست است، ریست کن
+    if session.pop("welfare_just_returned", False):
+        session["welfare_reply_sent"] = False
+        session.pop("welfare_qty_msg_id", None)
+        session.pop("welfare_qty_input", None)
+
     db = SessionLocal()
 
     try:
@@ -1711,7 +1724,7 @@ async def _render_welfare_selection_impl(chat_id: str):
             name_counts[base] = name_counts.get(base, 0) + 1
 
         name_seen = {}
-        inline_rows = []
+        inline_buttons = []
         food_name_map = {}
 
         lines = [
@@ -1732,7 +1745,11 @@ async def _render_welfare_selection_impl(chat_id: str):
             qty = selected.get(entry.id, 0)
             mark = " ✅" if entry.id == active_food_id else ""
 
-            if qty:
+            # اگر در حال تایپ برای این غذا هستیم، buffer را نمایش بده
+            typing_buf = session.get(f"_typing_{entry.id}", "")
+            if entry.id == active_food_id and typing_buf:
+                lines.append(f"{display_name}{mark} — {typing_buf}▌")
+            elif qty:
                 lines.append(f"{display_name}{mark} — {qty} عدد")
             else:
                 lines.append(f"{display_name}{mark}")
@@ -1743,24 +1760,29 @@ async def _render_welfare_selection_impl(chat_id: str):
                 prefix = "🍽"
 
             if qty:
-                label = f"{prefix} {display_name} ({qty})"
+                label = f"{prefix} {display_name} ({qty} عدد)"
             else:
                 label = f"{prefix} {display_name}"
 
-            inline_rows.append([{
+            inline_buttons.append({
                 "text": label,
                 "callback_data": f"welfare_food:{entry.id}",
-            }])
+            })
             food_name_map[label] = entry.id
 
         lines.append("")
         if active_food_id and active_food_id in entry_map:
             lines.append("با ➖ / ➕ تعداد را تنظیم کنید.")
         else:
-            lines.append("از دکمه‌های بالا غذا را انتخاب کنید 👆")
+            lines.append("از دکمه‌های چسبیده به همین پیام غذا را انتخاب کنید 👇")
 
         session["food_name_map"] = food_name_map
         text = "\n".join(lines)
+
+        # inline ۲ ستونه
+        inline_rows = []
+        for i in range(0, len(inline_buttons), 2):
+            inline_rows.append(inline_buttons[i:i + 2])
         inline_kb = {"inline_keyboard": inline_rows}
 
         # پیام inline (غذاها) - ارسال یا ویرایش
@@ -1783,11 +1805,13 @@ async def _render_welfare_selection_impl(chat_id: str):
 
         # کیبورد پایین (کنترل‌ها) - فقط یک بار در هر فاز ارسال شود
         if not session.get("welfare_reply_sent"):
+            _empty = "\u200b"  # ZWSP نامرئی
             reply_kb = {
                 "keyboard": [
-                    ["➖", "✍️ ورود تعداد", "➕"],
-                    ["🗑 حذف", "✅ ثبت سفارش"],
-                    ["🔙 بازگشت", "🏠 منوی اصلی"],
+                    ["1", "2", "3", "➕"],
+                    ["4", "5", "6", "➖"],
+                    ["7", "8", "9", "✍️ پاک"],
+                    [_empty, "0", _empty, "✅ ثبت"],
                 ],
                 "resize_keyboard": True,
                 "one_time_keyboard": False,
@@ -1795,7 +1819,7 @@ async def _render_welfare_selection_impl(chat_id: str):
 
             r = await send_message(
                 chat_id,
-                "⬇️ از دکمه‌های زیر برای تنظیم تعداد استفاده کنید.",
+                "\u2060",
                 reply_kb,
             )
             new_reply_id = None
@@ -1911,6 +1935,12 @@ async def handle_welfare(chat_id: str):
             )
             return
 
+        # اگر session قبلی وجود دارد، پیام inline قدیمی را حذف کن
+        old = SESSIONS.get(str(chat_id)) or {}
+        old_inline = old.pop("welfare_inline_msg_id", None)
+        old_reply = old.pop("welfare_reply_msg_id", None)
+        old_date = old.pop("welfare_date_msg_id", None)
+
         SESSIONS[str(chat_id)] = {
             "state": "welfare_choose_date",
             "employee_id": employee.id,
@@ -1919,6 +1949,13 @@ async def handle_welfare(chat_id: str):
     finally:
         db.close()
 
+    for mid in (old_inline, old_reply, old_date):
+        if mid:
+            try:
+                await delete_message(chat_id, mid)
+            except Exception:
+                pass
+
     await send_welfare_date_menu(chat_id)
 
 
@@ -1926,6 +1963,13 @@ async def handle_welfare_date_choice(chat_id: str, value: str):
     session = SESSIONS.get(str(chat_id))
 
     if not session or session.get("state") != "welfare_choose_date":
+        return False
+
+    # اگر state الان welfare_waiting_quantity یا welfare_select است،
+    # این handler نباید ورودی را مصرف کند (تا dispatcher به handler درست برسد)
+    # این گارد قبلاً وجود داشت ولی چون در انتهای پیام متن fallback می‌آمد،
+    # حالا فقط وقتی value یکی از این دو دکمه‌ی واقعی است، ادامه بده
+    if value not in ("1", "2") and value not in ("1️⃣ امروز", "2️⃣ فردا"):
         return False
 
     if value == "1️⃣ امروز":
@@ -2035,7 +2079,34 @@ async def handle_welfare_date_choice(chat_id: str, value: str):
 async def handle_welfare_food_choice(chat_id: str, value: str):
     session = SESSIONS.get(str(chat_id))
 
-    if not session or session.get("state") != "welfare_select":
+    if not session:
+        return
+
+    current_state = session.get("state")
+
+    # اگر در حالت ورود تعداد هستیم، عدد فعلی را ذخیره کن و به select برگرد
+    if current_state == "welfare_waiting_quantity":
+        buf = session.get("welfare_qty_input", "")
+        old_food_id = session.get("active_food_id")
+        if buf and buf.isdigit() and old_food_id:
+            try:
+                n = int(buf)
+                if 1 <= n <= 9999:
+                    selected = session.setdefault("selected", {})
+                    selected[old_food_id] = n
+            except ValueError:
+                pass
+
+        # لغو تایمر auto و پاک کردن پیام عددی
+        _t = _QTY_TIMERS.pop(str(chat_id), None)
+        if _t and not _t.done():
+            _t.cancel()
+        await _welfare_cleanup_qty_msg(chat_id, session)
+        session["state"] = "welfare_select"
+        session["welfare_reply_sent"] = False
+        session.pop("welfare_qty_input", None)
+
+    if session.get("state") != "welfare_select":
         return
 
     try:
@@ -2073,7 +2144,9 @@ async def handle_welfare_quantity_request(chat_id: str, value: str):
     session["active_food_id"] = entry_id
     session["state"] = "welfare_waiting_quantity"
     session["welfare_reply_sent"] = False
-    session["welfare_qty_input"] = ""
+    # عدد اولیه: از selected اگر داشت، وگرنه خالی
+    existing_qty = (session.get("selected") or {}).get(entry_id, 0)
+    session["welfare_qty_input"] = str(existing_qty) if existing_qty else ""
 
     # پاک کردن پیام عددی قبلی (اگر مانده)
     old_qty_msg = session.pop("welfare_qty_msg_id", None)
@@ -2085,18 +2158,19 @@ async def handle_welfare_quantity_request(chat_id: str, value: str):
 
     numeric_kb = {
         "keyboard": [
-            ["1", "2", "3"],
-            ["4", "5", "6"],
-            ["7", "8", "9"],
-            ["0", "⬅️ انصراف", "✅ تأیید"],
+            ["5", "10", "20", "50", "100"],
+            ["➖", "➕", "✍️ پاک", "✅ تأیید"],
+            ["⬅️ انصراف"],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
     }
 
+    initial_qty = existing_qty if existing_qty else 0
     r = await send_message(
         chat_id,
-        "🔢 عدد مورد نظر را با دکمه‌های زیر وارد کنید، سپس ✅ تأیید.",
+        f"🔢 تعداد فعلی: {initial_qty}\n"
+        "با دکمه‌های 5/10/20/50/100 اضافه کنید یا ➖/➕ برای کم/زیاد یک‌تایی.",
         reply_markup=numeric_kb,
     )
     if isinstance(r, dict):
@@ -2237,15 +2311,19 @@ async def handle_welfare_submit(chat_id: str):
             )
             return
 
-        created_codes = []
+        created_items = []
 
+        # یک کد پایه برای کل سفارش گروهی
+        base_code = make_code("W", db, WelfareOrder)
+
+        idx = 0
         for entry_id, quantity in selected.items():
             if quantity <= 0:
                 continue
 
             entry = entry_map[entry_id]
-
-            code = make_code("W", db, WelfareOrder)
+            idx += 1
+            code = base_code if idx == 1 else f"{base_code}-{idx}"
 
             order = WelfareOrder(
                 tracking_code=code,
@@ -2259,27 +2337,26 @@ async def handle_welfare_submit(chat_id: str):
             )
 
             db.add(order)
-            created_codes.append(
-                (entry.food.name, quantity, code)
-            )
+            created_items.append((entry.food.name, quantity))
 
         db.commit()
 
         lines = [
             "✅ سفارش گروهی با موفقیت ثبت شد.",
             f"📅 تاریخ: {to_jalali(target_date)}",
+            f"🔖 کد پیگیری: {base_code}",
             "",
         ]
 
-        for food_name, quantity, code in created_codes:
-            lines.append(
-                f"🍽 {food_name}: {quantity} عدد"
-            )
-            lines.append(
-                f"🔖 کد پیگیری: {code}"
-            )
+        for food_name, quantity in created_items:
+            lines.append(f"🍽 {food_name}: {quantity} عدد")
 
-        prev_msg_id = session.get("welfare_msg_id")
+        # جمع‌آوری همه‌ی message_idهای مرتبط با این سفارش
+        inline_msg_id = session.get("welfare_inline_msg_id")
+        reply_msg_id = session.get("welfare_reply_msg_id")
+        date_msg_id = session.get("welfare_date_msg_id")
+        legacy_msg_id = session.get("welfare_msg_id")
+        qty_msg_id = session.get("welfare_qty_msg_id")
 
         clear_session(chat_id)
 
@@ -2300,17 +2377,105 @@ async def handle_welfare_submit(chat_id: str):
             reply_markup=main_menu_keyboard(is_admin, is_welfare_manager),
         )
 
-        if prev_msg_id:
-            try:
-                await delete_message(chat_id, prev_msg_id)
-            except Exception:
-                pass
+        for mid in (inline_msg_id, reply_msg_id, date_msg_id, legacy_msg_id, qty_msg_id):
+            if mid:
+                try:
+                    await delete_message(chat_id, mid)
+                except Exception:
+                    pass
 
     except Exception:
         db.rollback()
         raise
     finally:
         db.close()
+
+
+_QTY_TIMERS: dict = {}
+_WELFARE_NUM_TIMERS: dict = {}
+
+
+def _schedule_welfare_number_commit(chat_id, food_id):
+    """بعد از 0.8 ثانیه سکوت، عدد تایپ‌شده را در selected می‌نشاند."""
+    key = f"{chat_id}:{food_id}"
+    old = _WELFARE_NUM_TIMERS.pop(key, None)
+    if old and not old.done():
+        old.cancel()
+
+    async def _commit():
+        await asyncio.sleep(0.8)
+        session = SESSIONS.get(str(chat_id))
+        if not session or session.get("state") != "welfare_select":
+            return
+        if session.get("active_food_id") != food_id:
+            return
+
+        buf = session.get(f"_typing_{food_id}", "")
+        if not buf or not buf.isdigit():
+            return
+
+        try:
+            n = int(buf)
+        except ValueError:
+            return
+        if n < 0 or n > 9999:
+            n = min(max(n, 0), 9999)
+
+        selected = session.setdefault("selected", {})
+        selected[food_id] = n
+        session[f"_typing_{food_id}"] = ""
+
+        await render_welfare_selection(chat_id)
+
+    async def _wrapper():
+        try:
+            await _commit()
+        except Exception:
+            pass
+
+    try:
+        _WELFARE_NUM_TIMERS[key] = asyncio.create_task(_wrapper())
+    except RuntimeError:
+        pass
+
+
+def _schedule_qty_autoconfirm(chat_id, buf: str):
+    """بعد از 1.5 ثانیه سکوت، عدد را خودکار تأیید می‌کند."""
+    key = str(chat_id)
+    # لغو تایمر قبلی
+    old = _QTY_TIMERS.pop(key, None)
+    if old and not old.done():
+        old.cancel()
+
+    async def _auto():
+        await asyncio.sleep(0.7)
+        session = SESSIONS.get(key)
+        if not session or session.get("state") != "welfare_waiting_quantity":
+            return
+        # اگر کاربر رقم جدیدی زده، تایمر جدید جایگزین شده — پس این یکی اجرا نشود
+        current_buf = session.get("welfare_qty_input", "")
+        if current_buf != buf:
+            return
+        # auto-apply
+        ok = await _welfare_apply_quantity(chat_id, session)
+        if not ok:
+            return
+        await _welfare_cleanup_qty_msg(chat_id, session)
+        session["state"] = "welfare_select"
+        session["welfare_reply_sent"] = False
+        session.pop("welfare_qty_input", None)
+        await render_welfare_selection(chat_id)
+
+    async def _wrapper():
+        try:
+            await _auto()
+        except Exception:
+            pass
+
+    try:
+        _QTY_TIMERS[key] = asyncio.create_task(_wrapper())
+    except RuntimeError:
+        pass
 
 
 async def _welfare_cleanup_qty_msg(chat_id: str, session: dict):
@@ -2373,8 +2538,48 @@ async def handle_welfare_quantities(chat_id: str, text: str):
 
     text = (text or "").strip()
 
+    # ➕ و ➖ برای ویرایش عدد در حال ورود
+    if text == "➕":
+        buf = session.get("welfare_qty_input", "") or "0"
+        try:
+            n = int(buf) + 1
+        except ValueError:
+            n = 1
+        if n > 9999:
+            n = 9999
+        session["welfare_qty_input"] = str(n)
+        msg_id = session.get("welfare_qty_msg_id")
+        if msg_id:
+            try:
+                await edit_message_text(chat_id, msg_id, f"🔢 تعداد فعلی: {n}")
+            except Exception:
+                pass
+        return True
+
+    if text == "➖":
+        buf = session.get("welfare_qty_input", "") or "0"
+        try:
+            n = int(buf) - 1
+        except ValueError:
+            n = 0
+        if n < 0:
+            n = 0
+        session["welfare_qty_input"] = str(n) if n > 0 else ""
+        msg_id = session.get("welfare_qty_msg_id")
+        if msg_id:
+            display = session["welfare_qty_input"] or "0"
+            try:
+                await edit_message_text(chat_id, msg_id, f"🔢 تعداد فعلی: {display}")
+            except Exception:
+                pass
+        return True
+
     # انصراف → برگشت به انتخاب غذا بدون تغییر
     if text == "⬅️ انصراف":
+        # لغو تایمر auto
+        _t = _QTY_TIMERS.pop(str(chat_id), None)
+        if _t and not _t.done():
+            _t.cancel()
         await _welfare_cleanup_qty_msg(chat_id, session)
         session["state"] = "welfare_select"
         session["welfare_reply_sent"] = False
@@ -2383,6 +2588,10 @@ async def handle_welfare_quantities(chat_id: str, text: str):
 
     # تأیید → اعمال تعداد
     if text == "✅ تأیید":
+        # لغو تایمر auto
+        _t = _QTY_TIMERS.pop(str(chat_id), None)
+        if _t and not _t.done():
+            _t.cancel()
         ok = await _welfare_apply_quantity(chat_id, session)
         if not ok:
             return True
@@ -2393,8 +2602,45 @@ async def handle_welfare_quantities(chat_id: str, text: str):
         await render_welfare_selection(chat_id)
         return True
 
-    # دکمه‌های عددی (یک رقم) → append/prepend بر اساس message_id
-    if text.isdigit() and len(text) == 1:
+    # نگاشت اعداد فارسی به لاتین
+    _fa_digits = "۰۱۲۳۴۵۶۷۸۹"
+    _en_digits = "0123456789"
+    _tr = str.maketrans(_fa_digits, _en_digits)
+    text_normalized = text.translate(_tr)
+
+    # ✍️ پاک → صفر کردن
+    if text == "✍️ پاک":
+        session["welfare_qty_input"] = ""
+        msg_id = session.get("welfare_qty_msg_id")
+        if msg_id:
+            try:
+                await edit_message_text(chat_id, msg_id, "🔢 تعداد فعلی: 0")
+            except Exception:
+                pass
+        return True
+
+    # دکمه‌های افزودنی: 5, 10, 20, 50, 100
+    if text in {"5", "10", "20", "50", "100"}:
+        add = int(text)
+        try:
+            cur = int(session.get("welfare_qty_input", "0") or "0")
+        except ValueError:
+            cur = 0
+        new_val = cur + add
+        if new_val > 9999:
+            new_val = 9999
+        session["welfare_qty_input"] = str(new_val)
+        msg_id = session.get("welfare_qty_msg_id")
+        if msg_id:
+            try:
+                await edit_message_text(chat_id, msg_id, f"🔢 تعداد فعلی: {new_val}")
+            except Exception:
+                pass
+        return True
+
+    # دکمه‌های عددی (یک رقم) → append/prepend بر اساس message_id (فقط برای تایپ دستی)
+    if text_normalized.isdigit() and len(text_normalized) == 1:
+        text = text_normalized
         cur_mid = session.get("_cur_msg_id")
         last_mid = session.get("_last_digit_mid")
         buf = session.get("welfare_qty_input", "")
@@ -2425,9 +2671,13 @@ async def handle_welfare_quantities(chat_id: str, text: str):
         return True
 
     # تایپ دستی عدد کامل (چندرقمی) → جایگزین
-    if text.isdigit() and len(text) > 1:
+    if text_normalized.isdigit() and len(text_normalized) > 1:
+        text = text_normalized
         if len(text) <= 5:
             session["welfare_qty_input"] = text
+            cur_mid = session.get("_cur_msg_id")
+            if cur_mid is not None:
+                session["_last_digit_mid"] = cur_mid
 
         msg_id = session.get("welfare_qty_msg_id")
         if msg_id:
@@ -2439,6 +2689,7 @@ async def handle_welfare_quantities(chat_id: str, text: str):
                 )
             except Exception:
                 pass
+        _schedule_qty_autoconfirm(chat_id, session.get("welfare_qty_input", ""))
         return True
 
     # بقیه متن‌ها نادیده گرفته می‌شوند
@@ -2453,33 +2704,111 @@ async def handle_welfare_reply_action(chat_id: str, text: str) -> bool:
         return False
 
     text = (text or "").strip()
+    # ZWSP (دکمه‌های نامرئی) را نادیده بگیر
+    if text == "\u200b":
+        return True
+
     active_food_id = session.get("active_food_id")
+
+    async def _warn_no_food():
+        r = await send_message(
+            chat_id,
+            "⚠️ اول یک غذا از دکمه‌های چسبیده به پیام بالا انتخاب کنید.",
+        )
+        if isinstance(r, dict):
+            wid = r.get("result", {}).get("message_id")
+            if wid:
+                asyncio.create_task(_delete_later(chat_id, wid, 1.5))
+
+    # ✍️ پاک — پاک کردن عدد فعلی
+    if text == "✍️ پاک":
+        if active_food_id:
+            session[f"_typing_{active_food_id}"] = ""
+            session.pop(f"_typing_last_mid_{active_food_id}", None)
+            selected = session.setdefault("selected", {})
+            selected[active_food_id] = 0
+            await render_welfare_selection(chat_id)
+        return True
+
+    # 🗑 حذف — قبل از بررسی اعداد
+    if text == "🗑":
+        if not active_food_id:
+            await _warn_no_food()
+            return True
+        await handle_welfare_remove(chat_id, str(active_food_id))
+        return True
+
+    # اگر عدد زد ولی غذایی فعال نیست → هشدار
+    if text.isdigit() and not active_food_id:
+        await _warn_no_food()
+        return True
+
+    # اعداد ۰–۹ → append/prepend فوری
+    if text.isdigit() and len(text) == 1 and active_food_id:
+        buf_key = f"_typing_{active_food_id}"
+        last_mid_key = f"_typing_last_mid_{active_food_id}"
+
+        cur_mid = session.get("_cur_msg_id")
+        last_mid = session.get(last_mid_key)
+        buf = session.get(buf_key, "")
+
+        if last_mid is None or cur_mid is None or cur_mid > last_mid:
+            new_buf = buf + text
+        else:
+            new_buf = text + buf
+
+        if len(new_buf) > 4:
+            new_buf = new_buf[:4]
+        session[buf_key] = new_buf
+        if cur_mid is not None:
+            session[last_mid_key] = cur_mid
+
+        try:
+            n = int(new_buf)
+        except ValueError:
+            n = 0
+        if n > 9999:
+            n = 9999
+        selected = session.setdefault("selected", {})
+        selected[active_food_id] = n
+
+        await render_welfare_selection(chat_id)
+        return True
 
     if text == "➕":
         if not active_food_id:
-            return False
+            await _warn_no_food()
+            return True
+        session[f"_typing_{active_food_id}"] = ""
         await handle_welfare_plus(chat_id, str(active_food_id))
         return True
 
     if text == "➖":
         if not active_food_id:
-            return False
+            await _warn_no_food()
+            return True
+        session[f"_typing_{active_food_id}"] = ""
         await handle_welfare_minus(chat_id, str(active_food_id))
         return True
 
     if text == "🗑 حذف":
         if not active_food_id:
-            return False
+            await _warn_no_food()
+            return True
         await handle_welfare_remove(chat_id, str(active_food_id))
         return True
 
     if text == "✍️ ورود تعداد":
+        # دیگر استفاده نمی‌شود، ولی برای سازگاری عقب‌رو حفظ می‌شود
         if not active_food_id:
-            return False
+            await _warn_no_food()
+            return True
         await handle_welfare_quantity_request(chat_id, str(active_food_id))
         return True
 
-    if text == "✅ ثبت سفارش":
+    if text in ("✅ ثبت", "✅ ثبت سفارش"):
+        if active_food_id:
+            session[f"_typing_{active_food_id}"] = ""
         await handle_welfare_submit(chat_id)
         return True
 
@@ -2842,6 +3171,7 @@ async def bale_webhook(request: Request):
 
         if cb_chat_id is not None:
             prefix, _, value = data.partition(":")
+            print(f"[DBG-CB] data={data!r} prefix={prefix!r} value={value!r}", flush=True)
 
             if prefix == "nav":
                 await handle_nav(cb_chat_id, value)
@@ -2982,7 +3312,6 @@ async def bale_webhook(request: Request):
     # ادامه وضعیت‌های مکالمه
     handlers = [
         handle_order_date_choice,
-        handle_welfare_date_choice,
         handle_order_food_choice,
         handle_order_quantity,
         handle_order_confirm,
@@ -2990,6 +3319,7 @@ async def bale_webhook(request: Request):
         handle_cancel_choice,
         handle_welfare_quantities,
         handle_welfare_reply_action,
+        handle_welfare_date_choice,
         handle_menu_site_choice,
         handle_menu_food_choice,
     ]
