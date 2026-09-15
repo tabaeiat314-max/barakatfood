@@ -69,6 +69,28 @@ def _get_menu_lock(chat_id):
 
 # وضعیت موقت مکالمه هر کاربر
 SESSIONS: dict[str, dict] = {}
+_LAST_MSG_IDS: dict[str, dict] = {}
+_MENU_MSGS: dict[str, list] = {}
+
+
+async def _delete_menu_msgs(chat_id):
+    """حذف همه‌ی پیام‌های ربات در فلوی menu (پایدار، خارج از session)."""
+    key = str(chat_id)
+    ids = _MENU_MSGS.pop(key, [])
+    print(f"[DBG-MENUDEL] chat={chat_id} ids={ids}", flush=True)
+    for mid in ids:
+        try:
+            r = await delete_message(chat_id, mid)
+            print(f"[DBG-MENUDEL] deleted mid={mid} result={r}", flush=True)
+        except Exception as e:
+            print(f"[DBG-MENUDEL] error mid={mid}: {e}", flush=True)
+
+
+def _track_menu_msg(chat_id, mid):
+    if not mid:
+        return
+    key = str(chat_id)
+    _MENU_MSGS.setdefault(key, []).append(mid)
 
 ADMIN_ROLES = {"ادمین", "مدیر سیستم", "مدیر سیستم تست"}
 
@@ -367,8 +389,13 @@ async def handle_nav(chat_id: str, value: str):
             "welfare_msg_id",
             "welfare_qty_msg_id",
             "menu_food_msg_id",
+            "menu_site_msg_id",
         ):
             mid = session.get(key)
+            if mid:
+                to_delete.append(mid)
+        # پیام‌های carrier منو (ممکن است چندتا باشند)
+        for mid in session.get("menu_carrier_ids") or []:
             if mid:
                 to_delete.append(mid)
 
@@ -379,6 +406,9 @@ async def handle_nav(chat_id: str, value: str):
                 await delete_message(chat_id, mid)
             except Exception:
                 pass
+
+        # حذف همه‌ی پیام‌های ردیابی‌شده‌ی menu
+        await _delete_menu_msgs(chat_id)
 
         await send_main_menu(chat_id)
         return True
@@ -469,6 +499,18 @@ async def handle_nav(chat_id: str, value: str):
 
 
 async def handle_start(chat_id: str):
+    # پاک کردن همه‌ی پیام‌های menu قبلی
+    await _delete_menu_msgs(chat_id)
+
+    # حذف پیام خوش‌آمد قبلی
+    last = _LAST_MSG_IDS.get(str(chat_id)) or {}
+    old_welcome = last.get("start_welcome")
+    if old_welcome:
+        try:
+            await delete_message(chat_id, old_welcome)
+        except Exception:
+            pass
+
     db = SessionLocal()
     try:
         employee = (
@@ -488,13 +530,26 @@ async def handle_start(chat_id: str):
                 .first()
                 is not None
             )
-            await send_message(
+            # حذف پیام خوش‌آمد قبلی (اگر داشتیم)
+            last = _LAST_MSG_IDS.get(str(chat_id)) or {}
+            old_welcome = last.get("start_welcome")
+            if old_welcome:
+                try:
+                    await delete_message(chat_id, old_welcome)
+                except Exception:
+                    pass
+
+            _r = await send_message(
                 chat_id,
                 f"خوش آمدید {employee.full_name} ✅\n"
                 f"نقش: {role_text}\n\n"
                 "از دکمه‌های پایین صفحه استفاده کنید 👇",
                 reply_markup=main_menu_keyboard(is_admin, is_welfare_manager),
             )
+            if isinstance(_r, dict):
+                _nid = _r.get("result", {}).get("message_id")
+                if _nid:
+                    _LAST_MSG_IDS.setdefault(str(chat_id), {})["start_welcome"] = _nid
             return
     finally:
         db.close()
@@ -710,6 +765,9 @@ async def handle_order_date_choice(chat_id: str, text: str, force_new: bool = Fa
             session = SESSIONS[str(chat_id)]
         finally:
             db_auto.close()
+
+    if not session:
+        return False
 
     if session.get("state") != "order_choose_date":
         return False
@@ -2865,6 +2923,9 @@ async def handle_welfare_reply_action(chat_id: str, text: str) -> bool:
 # =========================================================
 
 async def handle_menu_admin(chat_id: str):
+    # پاک کردن پیام‌های menu قبلی
+    await _delete_menu_msgs(chat_id)
+
     db = SessionLocal()
 
     try:
@@ -2915,7 +2976,7 @@ async def handle_menu_admin(chat_id: str):
         keyboard_rows = [[site.name] for site in sites]
         keyboard_rows.append(["🏠 منوی اصلی"])
 
-        await send_message(
+        _r = await send_message(
             chat_id,
             "مدیریت منو\n\nسایت مورد نظر را از دکمه‌های پایین انتخاب کنید 👇",
             reply_markup={
@@ -2924,6 +2985,10 @@ async def handle_menu_admin(chat_id: str):
                 "one_time_keyboard": False,
             },
         )
+        if isinstance(_r, dict):
+            _nid = _r.get("result", {}).get("message_id")
+            if _nid:
+                _track_menu_msg(chat_id, _nid)
 
     finally:
         db.close()
@@ -2936,6 +3001,9 @@ async def handle_menu_site_choice(chat_id: str, text: str, msg_id: int | None = 
 
     if not session or session.get("state") != "menu_choose_site":
         return False
+
+    # حذف همه‌ی پیام‌های مرحله‌ی قبل (پیام سایت)
+    await _delete_menu_msgs(chat_id)
 
     text = (text or "").strip()
     site_options = session.get("site_options", {}) or {}
@@ -2999,10 +3067,18 @@ async def handle_menu_site_choice(chat_id: str, text: str, msg_id: int | None = 
     finally:
         db.close()
 
-    # کیبورد پایین: «📤 ثبت منو» + «🏠 منوی اصلی»
+    # پیام «سایت را انتخاب کنید» را حذف کن (دیگر لازم نیست)
+    site_msg = session.pop("menu_site_msg_id", None)
+    if site_msg:
+        try:
+            await delete_message(chat_id, site_msg)
+        except Exception:
+            pass
+
+    # carrier برای به‌روزرسانی کیبورد پایین
     _cr = await send_message(
         chat_id,
-        "⌨️ برای ثبت منو از دکمه‌های پایین استفاده کنید.",
+        "\u200b",
         reply_markup={
             "keyboard": [["📤 ثبت منو", "🏠 منوی اصلی"]],
             "resize_keyboard": True,
@@ -3011,8 +3087,7 @@ async def handle_menu_site_choice(chat_id: str, text: str, msg_id: int | None = 
     )
     if isinstance(_cr, dict):
         _cid = _cr.get("result", {}).get("message_id")
-        if _cid:
-            session["menu_carrier_ids"] = (session.get("menu_carrier_ids") or []) + [_cid]
+        _track_menu_msg(chat_id, _cid)
 
     await render_menu_food_selection(chat_id)
     return True
@@ -3259,11 +3334,15 @@ async def handle_menu_submit(chat_id: str, text: str = "") -> bool:
         except Exception:
             pass
         try:
-            await send_message(
+            r = await send_message(
                 chat_id,
                 "🏠 به منوی اصلی برگشتید.",
                 reply_markup=main_menu_keyboard(is_admin, is_wm),
             )
+            if isinstance(r, dict):
+                mid = r.get("result", {}).get("message_id")
+                if mid:
+                    asyncio.create_task(_delete_later(chat_id, mid, 2.5))
         except Exception:
             pass
 
@@ -3535,17 +3614,32 @@ async def bale_webhook(request: Request):
         if _sess is not None:
             _sess["_cur_msg_id"] = _mid
 
-    # حذف خودکار پیام کاربر در فلوهای welfare و menu
-    _sess = SESSIONS.get(str(chat_id))
-    if _sess:
-        _state = str(_sess.get("state", ""))
-        if _state.startswith("welfare") or _state.startswith("menu") or _state == "menu_done":
-            _mid = message.get("message_id")
-            if _mid:
-                try:
-                    await delete_message(chat_id, _mid)
-                except Exception:
-                    pass
+    # حذف خودکار پیام کاربر:
+    # - اگر دستور است (با / شروع می‌شود)
+    # - اگر از دکمه‌های BUTTON_COMMANDS آمده
+    # - یا در فلوهای menu و welfare و order است
+    _mid = message.get("message_id")
+    if _mid:
+        _should_delete = (
+            text.startswith("/")
+            or text in BUTTON_COMMANDS
+            or text in ("🏠 منوی اصلی", "🔙 بازگشت")
+        )
+        if not _should_delete:
+            _sess = SESSIONS.get(str(chat_id))
+            if _sess:
+                _state = str(_sess.get("state", ""))
+                if _state.startswith(("welfare", "menu", "order")) or _state == "menu_done":
+                    _should_delete = True
+        if _should_delete:
+            try:
+                await delete_message(chat_id, _mid)
+            except Exception:
+                pass
+
+    # ZWSP / دکمه‌های نامرئی → نادیده
+    if text in ("\u200b", "\u200c", "\u200d", "\u2060"):
+        return {"ok": True}
 
     if text == "🔙 بازگشت":
         await handle_nav(chat_id, "back")
@@ -3568,6 +3662,7 @@ async def bale_webhook(request: Request):
 
     # دستورات اصلی
     if text == "/start":
+        # session را پاک کن ولی _LAST_MSG_IDS را نگه دار
         clear_session(chat_key)
         await handle_start(chat_id)
         return {"ok": True}
@@ -3636,12 +3731,6 @@ async def bale_webhook(request: Request):
 
         if handled:
             return {"ok": True}
-
-    await send_message(
-        chat_id,
-        "متوجه دستور شما نشدم.\n"
-        "برای راهنما /help را ارسال کنید.",
-    )
 
     return {"ok": True}
 
