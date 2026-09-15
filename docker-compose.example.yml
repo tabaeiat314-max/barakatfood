@@ -21,7 +21,7 @@ services:
     network_mode: "host"
     environment:
       DATABASE_URL: postgresql+psycopg://barakat:barakat_dev_password@localhost:5432/barakat
-      BALE_BOT_TOKEN: "1414334073:tY-FleWK8sITcp8kDYTOinfcJ7FmlYEIaNw"
+      BALE_BOT_TOKEN: "PUT_YOUR_TOKEN_HERE"
       CODESPACE_NAME: "${CODESPACE_NAME}"
     volumes:
       - ./backend/alembic/versions:/app/alembic/versions
