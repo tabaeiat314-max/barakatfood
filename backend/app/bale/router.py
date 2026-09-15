@@ -696,7 +696,7 @@ async def handle_order(chat_id: str):
 async def handle_order_date_choice(chat_id: str, text: str, force_new: bool = False):
     session = SESSIONS.get(str(chat_id))
 
-    if force_new or not session:
+    if force_new:
         db_auto = SessionLocal()
         try:
             employee = get_employee(chat_id, db_auto)
@@ -1907,14 +1907,14 @@ async def send_welfare_date_menu(chat_id: str):
     if date_buttons:
         rows.append(date_buttons)
 
-    rows.append(["🔙 بازگشت", "🏠 منوی اصلی"])
+    rows.append(["🏠 منوی اصلی"])
 
     if not today_ok and not tomorrow_ok:
         await send_message(
             chat_id,
             "⛔ مهلت ثبت سفارش برای امروز و فردا به پایان رسیده است.",
             reply_markup={
-                "keyboard": [["🔙 بازگشت", "🏠 منوی اصلی"]],
+                "keyboard": [["🏠 منوی اصلی"]],
                 "resize_keyboard": True,
                 "one_time_keyboard": False,
             },
@@ -2931,6 +2931,8 @@ async def handle_menu_admin(chat_id: str):
 
 async def handle_menu_site_choice(chat_id: str, text: str, msg_id: int | None = None):
     session = SESSIONS.get(str(chat_id))
+    _s = session.get("state") if session else None
+    print(f"[DBG-MENU] enter text={text!r} state={_s} msg_id={msg_id}", flush=True)
 
     if not session or session.get("state") != "menu_choose_site":
         return False
@@ -2978,13 +2980,39 @@ async def handle_menu_site_choice(chat_id: str, text: str, msg_id: int | None = 
         session["site_id"] = site.id
         session["site_name"] = site.name
         session["food_options"] = {food.name: food.id for food in foods}
-        session["selected_foods"] = set()
-        # ذخیره msg_id همان پیام inline برای ویرایش‌های بعدی
+
+        # غذاهای قبلاً ثبت‌شده در منوی امروز این سایت را ✅ کن
+        today = today_iran()
+        existing_entries = (
+            db.query(MenuEntry)
+            .filter(
+                MenuEntry.site_id == site.id,
+                MenuEntry.date == today,
+            )
+            .all()
+        )
+        session["selected_foods"] = {e.food_id for e in existing_entries}
+
         if msg_id is not None:
             session["menu_food_msg_id"] = msg_id
 
     finally:
         db.close()
+
+    # کیبورد پایین: «📤 ثبت منو» + «🏠 منوی اصلی»
+    _cr = await send_message(
+        chat_id,
+        "⌨️ برای ثبت منو از دکمه‌های پایین استفاده کنید.",
+        reply_markup={
+            "keyboard": [["📤 ثبت منو", "🏠 منوی اصلی"]],
+            "resize_keyboard": True,
+            "one_time_keyboard": False,
+        },
+    )
+    if isinstance(_cr, dict):
+        _cid = _cr.get("result", {}).get("message_id")
+        if _cid:
+            session["menu_carrier_ids"] = (session.get("menu_carrier_ids") or []) + [_cid]
 
     await render_menu_food_selection(chat_id)
     return True
@@ -3029,10 +3057,6 @@ async def render_menu_food_selection(chat_id: str):
     rows = []
     for i in range(0, len(food_buttons), 2):
         rows.append(food_buttons[i:i + 2])
-
-    rows.append([
-        {"text": "📤 ثبت منو", "callback_data": "menu_submit:1"},
-    ])
 
     inline_kb = {"inline_keyboard": rows}
 
@@ -3134,33 +3158,50 @@ async def handle_menu_submit(chat_id: str, text: str = "") -> bool:
     site_id = session.get("site_id")
     db = SessionLocal()
     added = []
+    removed = []
     try:
         target_date = today_iran()
-        for display_order, food_id in enumerate(sorted(selected), start=1):
-            existing = (
-                db.query(MenuEntry)
-                .filter(
-                    MenuEntry.site_id == site_id,
-                    MenuEntry.date == target_date,
-                    MenuEntry.food_id == food_id,
-                )
-                .first()
+
+        # همه‌ی entries امروز این سایت
+        existing_entries = (
+            db.query(MenuEntry)
+            .filter(
+                MenuEntry.site_id == site_id,
+                MenuEntry.date == target_date,
             )
-            if existing:
-                continue
+            .all()
+        )
+        existing_by_fid = {e.food_id: e for e in existing_entries}
+
+        # حذف مواردی که در DB هستند ولی در انتخاب کاربر نیستند
+        for food_id, entry in existing_by_fid.items():
+            if food_id not in selected:
+                food = db.query(Food).filter(Food.id == food_id).first()
+                if food:
+                    removed.append(food.name)
+                db.delete(entry)
+        db.flush()
+
+        # اضافه کردن موارد جدید + به‌روزرسانی display_order
+        for display_order, food_id in enumerate(sorted(selected), start=1):
             food = db.query(Food).filter(Food.id == food_id).first()
             if not food:
                 continue
-            entry = MenuEntry(
-                date=target_date,
-                site_id=site_id,
-                food_id=food_id,
-                display_order=display_order,
-                status="منتشر",
-                is_selectable=True,
-            )
-            db.add(entry)
-            added.append(food.name)
+            if food_id in existing_by_fid:
+                # به‌روزرسانی display_order
+                existing_by_fid[food_id].display_order = display_order
+            else:
+                entry = MenuEntry(
+                    date=target_date,
+                    site_id=site_id,
+                    food_id=food_id,
+                    display_order=display_order,
+                    status="منتشر",
+                    is_selectable=True,
+                )
+                db.add(entry)
+                added.append(food.name)
+
         db.commit()
     finally:
         db.close()
@@ -3188,10 +3229,15 @@ async def handle_menu_submit(chat_id: str, text: str = "") -> bool:
     prev_msg_id = session.get("menu_food_msg_id")
     clear_session(chat_id)
 
+    parts = []
     if added:
-        msg = "✅ منوی امروز منتشر شد.\n\n" + "\n".join(f"🍽 {n}" for n in added)
+        parts.append("➕ اضافه شد: " + "، ".join(added))
+    if removed:
+        parts.append("➖ حذف شد: " + "، ".join(removed))
+    if not added and not removed:
+        msg = "ℹ️ منوی امروز بدون تغییر ماند."
     else:
-        msg = "ℹ️ غذاهای انتخاب‌شده قبلاً در منوی امروز وجود داشتند."
+        msg = "✅ منوی امروز به‌روزرسانی شد.\n\n" + "\n".join(parts)
 
     if prev_msg_id:
         try:
@@ -3200,6 +3246,28 @@ async def handle_menu_submit(chat_id: str, text: str = "") -> bool:
             await send_message(chat_id, msg)
     else:
         await send_message(chat_id, msg)
+
+    # state را menu_done بگذار تا auto-delete پیام‌های بعدی کاربر هم فعال بماند
+    SESSIONS[str(chat_id)] = {"state": "menu_done"}
+
+    # carrier برای برگرداندن کیبورد اصلی — با تأخیر در background
+    async def _restore_main():
+        await asyncio.sleep(3.0)
+        try:
+            if prev_msg_id:
+                await delete_message(chat_id, prev_msg_id)
+        except Exception:
+            pass
+        try:
+            await send_message(
+                chat_id,
+                "🏠 به منوی اصلی برگشتید.",
+                reply_markup=main_menu_keyboard(is_admin, is_wm),
+            )
+        except Exception:
+            pass
+
+    asyncio.create_task(_restore_main())
 
     return True
 
@@ -3471,10 +3539,13 @@ async def bale_webhook(request: Request):
     _sess = SESSIONS.get(str(chat_id))
     if _sess:
         _state = str(_sess.get("state", ""))
-        if _state.startswith("welfare") or _state.startswith("menu"):
+        if _state.startswith("welfare") or _state.startswith("menu") or _state == "menu_done":
             _mid = message.get("message_id")
             if _mid:
-                asyncio.create_task(_delete_later(chat_id, _mid, 0.05))
+                try:
+                    await delete_message(chat_id, _mid)
+                except Exception:
+                    pass
 
     if text == "🔙 بازگشت":
         await handle_nav(chat_id, "back")
@@ -3556,6 +3627,7 @@ async def bale_webhook(request: Request):
         handle_welfare_quantities,
         handle_welfare_reply_action,
         handle_welfare_date_choice,
+        handle_menu_submit,
         handle_menu_site_choice,
     ]
 
