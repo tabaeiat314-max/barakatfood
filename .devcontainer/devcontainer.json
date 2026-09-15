@@ -1,0 +1,25 @@
+{
+  "name": "Barakat Food System",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-azuretools.vscode-docker"
+      ]
+    }
+  },
+  "portsAttributes": {
+    "8000": {
+      "label": "Backend",
+      "onAutoForward": "public"
+    },
+    "5432": {
+      "label": "PostgreSQL",
+      "onAutoForward": "ignore"
+    }
+  },
+  "otherPortsAttributes": {
+    "onAutoForward": "ignore"
+  },
+  "postCreateCommand": "echo 'Codespace آماده است. برای اجرا: docker compose up -d'"
+}
